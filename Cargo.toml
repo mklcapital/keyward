@@ -1,0 +1,46 @@
+[package]
+name = "keyward"
+version = "0.1.0"
+edition = "2021"
+description = "Rotate cloud provider credentials across services into your secret store"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
+
+# Scheduler: interval + jitter parsing, RNG, on-disk state dirs.
+humantime-serde = "1"
+rand = "0.8"
+dirs = "6"
+
+# Crypto: envelope encryption of stored metadata / recreation recipes.
+# `age` (X25519 + ChaCha20-Poly1305) for the envelope. It re-exports the `secrecy`
+# types it uses (SecretString), so we reach them via `age::secrecy` — no separate
+# secrecy dep, which avoids pulling in a second, incompatible secrecy version.
+age = "0.11"
+
+# `ring` serves two providers: Cloudflare R2's S3 secret-access-key is the
+# SHA-256 of the API token's `value`, and AWS SigV4 request signing needs
+# HMAC-SHA256 + SHA-256. `ring` is already in the tree (pulled in transitively
+# by reqwest's rustls-tls), so declaring it here adds no new download — it just
+# makes the dependency explicit. We deliberately avoid the full `aws-sdk-*`
+# stack: a ~100-line SigV4 helper keeps the static binary small and the
+# dependency surface auditable, which matters for a security tool.
+ring = "0.17"
+
+[dev-dependencies]
+tempfile = "3"
+humantime = "2"
+
+[profile.release]
+strip = true
+lto = true

@@ -1,0 +1,4 @@
+/target
+keyward.toml
+*.log
+.DS_Store

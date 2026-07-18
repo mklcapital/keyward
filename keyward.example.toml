@@ -1,0 +1,46 @@
+# keyward — credential rotation config. Copy to keyward.toml and edit.
+# One [[target]] per credential keyward is allowed to rotate.
+
+[[target]]
+name         = "b2-service"          # your label
+provider     = "backblaze"           # backblaze | cloudflare | aws
+vault        = "Personal"            # 1Password vault
+item         = "B2 Service Key"      # the SERVICE credential that gets rotated
+field_key_id = "keyID"               # 1Password field with the key id
+field_secret = "applicationKey"      # 1Password field with the secret
+
+# The MANAGEMENT credential — least privilege: may ONLY create/delete B2 keys,
+# never read/write buckets, never account admin. This is the crown jewel; guard it.
+management_item   = "B2 Key Manager"
+mgmt_field_key_id = "keyID"
+mgmt_field_secret = "applicationKey"
+
+key_name_prefix = "keyward-b2"       # new keys are named <prefix>-<UTC timestamp>
+
+# --- optional: scheduled rotation with jitter (keyward schedule) ---
+# Rotate this target every `interval`, offset by a uniform random ± `jitter`, so a
+# fleet's rotations don't all fire at the same predictable instant. humantime
+# notation: 30d, 12h, 1week, 90min, 45s … Omit [schedule] to rotate on demand only.
+[target.schedule]
+interval = "30d"
+jitter   = "36h"
+
+# --- optional: zero-knowledge recreation recipe ---
+# An age recipient (public key, `age1...`). When set, each rotation seals an
+# encrypted "recreation recipe" (how to re-mint an identical key — NOT the secret)
+# that only the holder of the matching age identity can decrypt. Generate a keypair
+# with `age-keygen`; keep the AGE-SECRET-KEY on your worker/vault, put the age1...
+# public key here.
+# recipe_recipient = "age1qqq..."
+# console_url      = "https://secure.backblaze.com/app_keys.htm"
+
+# --- add more targets as providers land ---
+# [[target]]
+# name = "r2-service"
+# provider = "cloudflare"
+# vault = "Personal"
+# item = "R2 Service Key"
+# field_key_id = "access_key_id"
+# field_secret = "secret_access_key"
+# management_item = "Cloudflare R2 Token Manager"
+# ...
