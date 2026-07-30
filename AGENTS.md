@@ -21,10 +21,16 @@ Non-obvious notes for this environment:
 - `keyward.toml` is gitignored; copy `keyward.example.toml` to `keyward.toml`
   for local runs.
 
-### Project direction: Rust/Swift only
+### Project direction (per maintainer)
 
-Per the maintainer: the long-term goal is that everything ships as Rust and/or
-Swift targeting the latest Apple (iPhone/iPad/macOS) technologies. The Python
-sibling repos are prototypes to be ported. `keyward` is already the reference
-Rust implementation — new functionality here stays in Rust (or Swift where an
-Apple-platform UI is involved), with a short rationale for the language choice.
+- **These are Linux server apps and must be Rust only.** `keyward` is already the
+  reference Rust implementation; keep new functionality in Rust. The Python
+  sibling repos (`ltm-mcp`, `mission-control`) are prototypes to be reimplemented
+  in Rust.
+- **Swift is only for genuinely native Apple client apps** (macOS / iPhone /
+  iPad / Apple Silicon viewers) that talk to these servers — never for the
+  servers themselves. All heavy lifting, including GUI, stays server-side and is
+  exposed over web tech (and optional Apple-native viewers/browsers).
+- **Prefer latest stable tooling** (e.g. current Rust stable, latest stable
+  PostgreSQL where a datastore is involved) — no pinning to stale majors without
+  a concrete reason.
