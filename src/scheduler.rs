@@ -428,4 +428,94 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn load_corrupt_state_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(State::load(&path).is_err());
+    }
+
+    #[test]
+    fn format_plan_marks_overdue_and_formats_longer_horizons() {
+        assert_eq!(format_plan(&[], Utc::now()), "(no targets have a [schedule] block)");
+        let now = DateTime::parse_from_rfc3339("2026-10-11T10:00:00+00:00").unwrap().with_timezone(&Utc);
+        let overdue = vec![PlanEntry {
+            target: "late".into(),
+            next_run: now - chrono::Duration::minutes(5),
+            freshly_scheduled: false,
+        }];
+        let text = format_plan(&overdue, now);
+        assert!(text.contains("due now"), "{text}");
+        assert!(text.contains("[persisted]"), "{text}");
+
+        let soon = vec![PlanEntry {
+            target: "soon".into(),
+            next_run: now + chrono::Duration::minutes(90),
+            freshly_scheduled: true,
+        }];
+        let text = format_plan(&soon, now);
+        assert!(text.contains("in 1h30m"), "{text}");
+        assert!(text.contains("[new]"), "{text}");
+
+        let later = vec![PlanEntry {
+            target: "later".into(),
+            next_run: now + chrono::Duration::hours(26),
+            freshly_scheduled: false,
+        }];
+        let text = format_plan(&later, now);
+        assert!(text.contains("in 1d2h"), "{text}");
+    }
+
+    struct SelectiveHook {
+        fail: &'static str,
+        fired: Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RotateHook for SelectiveHook {
+        async fn fire(&self, target: &Target) -> Result<()> {
+            let ok = target.name != self.fail;
+            self.fired.lock().unwrap().push((target.name.clone(), ok));
+            if ok {
+                Ok(())
+            } else {
+                anyhow::bail!("rotation failed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_rotation_still_advances_the_schedule_and_does_not_stop_the_fleet() {
+        // Both targets are already due. "a" is sooner and its hook fails; the loop
+        // must still push its next_run out (no hot retry) and then fire "b".
+        let cfg = cfg_with(vec![
+            ("a", Some(sched("30d", "0s"))),
+            ("b", Some(sched("30d", "0s"))),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let mut state = State::default();
+        let now = Utc::now();
+        state.next_run.insert("a".into(), now - chrono::Duration::seconds(10));
+        state.next_run.insert("b".into(), now - chrono::Duration::seconds(5));
+        state.save(&path).unwrap();
+
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = SelectiveHook { fail: "a", fired: fired.clone() };
+        let n = run(&cfg, &path, &hook, Some(2)).await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            &*fired.lock().unwrap(),
+            &vec![("a".to_string(), false), ("b".to_string(), true)]
+        );
+
+        let after = State::load(&path).unwrap();
+        assert!(after.last_run.contains_key("a"));
+        assert!(after.last_run.contains_key("b"));
+        let horizon = Utc::now() + chrono::Duration::days(29);
+        assert!(after.next_run["a"] > horizon, "failed target must not be immediately retried");
+        assert!(after.next_run["b"] > horizon);
+    }
 }

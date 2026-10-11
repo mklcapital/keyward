@@ -34,3 +34,27 @@ pub fn get(name: &str) -> Result<Box<dyn Provider>> {
         other => anyhow::bail!("unknown provider: {other}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_aliases_resolve_to_the_implementation_id() {
+        for (name, id) in [
+            ("backblaze", "backblaze"),
+            ("b2", "backblaze"),
+            ("cloudflare", "cloudflare"),
+            ("r2", "cloudflare"),
+            ("aws", "aws"),
+        ] {
+            assert_eq!(get(name).unwrap().id(), id, "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_provider_is_rejected() {
+        let err = get("dropbox").err().expect("dropbox should be rejected");
+        assert!(err.to_string().contains("unknown provider: dropbox"), "{err}");
+    }
+}
