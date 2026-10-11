@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn unknown_provider_is_rejected() {
-        let err = get("dropbox").unwrap_err();
+        let err = get("dropbox").err().expect("dropbox should be rejected");
         assert!(err.to_string().contains("unknown provider: dropbox"), "{err}");
     }
 }
