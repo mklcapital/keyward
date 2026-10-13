@@ -894,6 +894,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_key_at_limit_does_not_delete_a_live_key_when_status_case_varies() {
+        // IAM has echoed "ACTIVE" / "inactive" as well as the canonical spellings.
+        // The older key is live; only the newer inactive key may be reclaimed.
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIALIVE", "ACTIVE", "2025-01-01T00:00:00Z"),
+                    ("AKIASTALE", "inactive", "2026-06-01T00:00:00Z"),
+                ]),
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete(make-room), create");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIASTALE"));
+        assert!(!seen[1].body.contains("AKIALIVE"), "a live key must survive odd status casing");
+    }
+
+    #[tokio::test]
+    async fn create_key_at_limit_deletes_the_oldest_inactive_key_not_list_order() {
+        // Both keys are already inactive (the grace window closed on each).
+        // List order puts the newer key first; the victim is the older create date.
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIANEWER", "Inactive", "2026-08-01T00:00:00Z"),
+                    ("AKIAOLDER", "Inactive", "2024-01-01T00:00:00Z"),
+                ]),
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        prov.create_key(&mgmt(), "kw", None).await.unwrap();
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete(make-room), create");
+        assert!(seen[1].body.contains("AccessKeyId=AKIAOLDER"));
+        assert!(
+            !seen[1].body.contains("AKIANEWER"),
+            "the newer inactive key is the rollback credential and must be kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_key_refuses_two_active_keys_regardless_of_status_case() {
+        // If "ACTIVE" were compared case-sensitively it would look inactive, and
+        // make-room would delete the older live key to free a slot.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            &list_keys_xml(&[
+                ("AKIAA", "ACTIVE", "2024-01-01T00:00:00Z"),
+                ("AKIAB", "active", "2026-06-01T00:00:00Z"),
+            ]),
+        )]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("2 ACTIVE"), "got: {msg}");
+        assert_eq!(prov.transport.seen().len(), 1, "list only; no delete, no create");
+        assert!(!prov.transport.seen()[0].body.contains("DeleteAccessKey"));
+    }
+
+    #[tokio::test]
+    async fn create_key_without_a_secret_fails_closed() {
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(
+                200,
+                "<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey>\
+                 <AccessKeyId>AKIANEW</AccessKeyId></AccessKey></CreateAccessKeyResult>\
+                 </CreateAccessKeyResponse>",
+            ),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("SecretAccessKey"), "got: {msg}");
+        assert_eq!(prov.transport.seen().len(), 2, "must not keep calling after a secret-less mint");
+    }
+
+    #[tokio::test]
     async fn create_key_at_limit_with_two_active_refuses() {
         // Both keys Active at the cap → refuse rather than sever a live credential.
         let fake = FakeTransport::new(vec![FakeTransport::ok(
