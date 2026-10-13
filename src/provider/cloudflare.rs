@@ -444,6 +444,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unusable_copied_policies_fall_back_to_read_only() {
+        // A discovered scope that is not a non-empty policy array must not be
+        // forwarded. Empty, non-array, and unparseable values all fail closed
+        // to the read-only R2 permission group.
+        let cases: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["not-json".into()],
+            vec!["[]".into()],
+            vec!["{}".into()],
+            vec!["null".into()],
+            vec!["\"admin\"".into()],
+        ];
+        for caps in cases {
+            let fake = FakeTransport::new(vec![FakeTransport::ok(
+                200,
+                envelope(json!({ "id": "tok-new", "value": "v", "name": "kw" })),
+            )]);
+            let prov = Cloudflare::with_transport(fake);
+            let like = KeyInfo {
+                key_id: "tok-old".into(),
+                capabilities: caps.clone(),
+                ..KeyInfo::default()
+            };
+            prov.create_key(&mgmt(), "kw", Some(&like)).await.unwrap();
+
+            let sent = prov.transport.last().body.unwrap();
+            let policies = &sent["policies"];
+            assert!(policies.is_array(), "policies must stay an array, got {policies}");
+            assert_eq!(policies.as_array().unwrap().len(), 1);
+            assert_eq!(
+                policies[0]["permission_groups"][0]["id"],
+                R2_READ_PERMISSION_GROUP,
+                "unusable scope {caps:?} must not widen past read-only"
+            );
+            assert_eq!(policies[0]["effect"], "allow");
+            let rendered = policies.to_string();
+            assert!(rendered.contains("com.cloudflare.api.account.acct-123"));
+            assert!(!rendered.contains("not-json"));
+            assert!(!rendered.contains("admin"));
+        }
+    }
+
+    #[tokio::test]
+    async fn create_key_without_token_value_fails_closed() {
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "name": "kw" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no `value`"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn verify_key_accepts_success_without_status_and_rejects_blank_status() {
+        let mut cred = Credential::new("tok", "s3-secret");
+        cred.extra.insert("account_id".into(), "acct-123".into());
+        cred.extra.insert("cf_token_value".into(), "raw-token-secret".into());
+
+        let ok = Cloudflare::with_transport(FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok" })),
+        )]));
+        ok.verify_key(&cred).await.unwrap();
+
+        let blank = Cloudflare::with_transport(FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok", "status": "" })),
+        )]));
+        let err = blank.verify_key(&cred).await.unwrap_err();
+        assert!(err.to_string().contains("not active"), "got: {err}");
+    }
+
+    #[tokio::test]
     async fn create_key_falls_back_to_read_only_policy() {
         let fake = FakeTransport::new(vec![FakeTransport::ok(
             200,
