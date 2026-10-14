@@ -428,4 +428,43 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[tokio::test]
+    async fn run_loop_does_not_rotate_removed_or_prefix_targets() {
+        // Persisted state can outlive a target. A removed credential, or one
+        // whose name merely shares a prefix with a live target, must not fire.
+        let cfg = cfg_with(vec![
+            ("live", Some(sched("30d", "0s"))),
+            ("live-backup", Some(sched("30d", "0s"))),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let now = Utc::now();
+        let mut state = State::default();
+        state.next_run.insert("retired".into(), now - chrono::Duration::hours(2));
+        state.next_run.insert("live-old".into(), now - chrono::Duration::hours(1));
+        state.next_run.insert("live-backup".into(), now - chrono::Duration::seconds(30));
+        state.next_run.insert("live".into(), now - chrono::Duration::seconds(5));
+        state.save(&path).unwrap();
+
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = CountingHook {
+            count: Arc::new(AtomicUsize::new(0)),
+            fired: fired.clone(),
+        };
+        let n = run(&cfg, &path, &hook, Some(2)).await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            &*fired.lock().unwrap(),
+            &vec!["live-backup".to_string(), "live".to_string()]
+        );
+
+        let after = State::load(&path).unwrap();
+        assert!(!after.last_run.contains_key("retired"));
+        assert!(!after.last_run.contains_key("live-old"));
+        assert!(after.last_run.contains_key("live"));
+        assert!(after.last_run.contains_key("live-backup"));
+        assert!(after.next_run["retired"] < now);
+        assert!(after.next_run["live-old"] < now);
+    }
 }

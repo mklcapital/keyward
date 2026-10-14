@@ -328,4 +328,45 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn seal_json_to_recipient_hides_the_recipe_and_fails_closed() {
+        let kp = KeyPair::generate();
+        let recipe = RecreationRecipe {
+            provider: "aws".into(),
+            console_url: Some("https://console.aws.amazon.com/iam".into()),
+            login_reference: Some("op://Infra/aws-login".into()),
+            capabilities: vec!["iam:CreateAccessKey".into()],
+            resource_restrictions: vec!["arn:aws:iam::123456789012:user/svc".into()],
+            notes: Some("do-not-leak-recipe-note".into()),
+        };
+
+        let env = Envelope::seal_json_to_recipient("aws/svc/recipe", &kp.recipient_str(), &recipe)
+            .unwrap();
+        assert_eq!(env.scheme, Scheme::AgeX25519);
+        assert_eq!(env.label, "aws/svc/recipe");
+        assert!(!env.ciphertext_b64.contains("console.aws"));
+        assert!(!env.ciphertext_b64.contains("CreateAccessKey"));
+        assert!(!env.ciphertext_b64.contains("arn:aws"));
+        assert!(!env.ciphertext_b64.contains("do-not-leak"));
+        assert!(!env.ciphertext_b64.contains("aws-login"));
+
+        let opened: RecreationRecipe = env.open_json(&kp).unwrap();
+        assert_eq!(opened, recipe);
+        assert!(env.open_json::<RecreationRecipe>(&KeyPair::generate()).is_err());
+        assert!(Envelope::seal_json_to_recipient("t", "not-a-recipient", &recipe).is_err());
+
+        let mut tampered = env.clone();
+        let mut raw = unb64(&tampered.ciphertext_b64).unwrap();
+        let mid = raw.len() / 2;
+        raw[mid] ^= 0xff;
+        tampered.ciphertext_b64 = b64(&raw);
+        assert!(tampered.open_json::<RecreationRecipe>(&kp).is_err());
+
+        tampered.ciphertext_b64 = "!!!not-base64!!!".into();
+        assert!(tampered.open(&kp).is_err());
+
+        let raw_env = Envelope::seal_to_recipient("t", &kp.recipient_str(), b"not-json").unwrap();
+        assert!(raw_env.open_json::<RecreationRecipe>(&kp).is_err());
+    }
 }

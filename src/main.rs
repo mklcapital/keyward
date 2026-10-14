@@ -60,6 +60,27 @@ enum Cmd {
     },
 }
 
+/// Choose which configured targets `rotate` will touch.
+///
+/// `--all` is every target, in config order. A name must match exactly: a prefix
+/// or a differently-cased sibling is a different credential and must not rotate.
+fn select_targets<'a>(
+    targets: &'a [config::Target],
+    name: Option<&str>,
+    all: bool,
+) -> Result<Vec<&'a config::Target>> {
+    let chosen: Vec<&config::Target> = if all {
+        targets.iter().collect()
+    } else {
+        let n = name.ok_or_else(|| anyhow::anyhow!("pass a target name, or --all"))?;
+        targets.iter().filter(|t| t.name == n).collect()
+    };
+    if chosen.is_empty() {
+        bail!("no matching target");
+    }
+    Ok(chosen)
+}
+
 /// Scheduler hook: on fire, run the rotation flow. `live` decides whether it's a
 /// real rotation or a dry-run. Default wiring is dry-run so `keyward schedule`
 /// never touches a live provider unless the operator passes --live.
@@ -110,15 +131,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Rotate { name, all, dry_run, no_revoke } => {
             let opts = rotation::Options { dry_run, revoke: !no_revoke };
-            let targets: Vec<&config::Target> = if all {
-                cfg.target.iter().collect()
-            } else {
-                let n = name.ok_or_else(|| anyhow::anyhow!("pass a target name, or --all"))?;
-                cfg.target.iter().filter(|t| t.name == n).collect()
-            };
-            if targets.is_empty() {
-                bail!("no matching target");
-            }
+            let targets = select_targets(&cfg.target, name.as_deref(), all)?;
             let mut failures = 0;
             for t in targets {
                 print!("rotating {:18} ({:10}) ... ", t.name, t.provider);
@@ -169,4 +182,66 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_targets;
+    use crate::config::Target;
+
+    fn target(name: &str) -> Target {
+        Target {
+            name: name.into(),
+            provider: "aws".into(),
+            vault: format!("vault-{name}"),
+            item: format!("item-{name}"),
+            field_key_id: "keyID".into(),
+            field_secret: "secret".into(),
+            management_item: format!("mgmt-{name}"),
+            mgmt_field_key_id: "keyID".into(),
+            mgmt_field_secret: "secret".into(),
+            key_name_prefix: "keyward".into(),
+            schedule: None,
+            recipe_recipient: None,
+            console_url: None,
+        }
+    }
+
+    #[test]
+    fn named_rotation_is_an_exact_match() {
+        let targets = vec![
+            target("prod"),
+            target("prod-backup"),
+            target("my-prod"),
+            target("Prod"),
+            target("prod"),
+        ];
+        let chosen = select_targets(&targets, Some("prod"), false).unwrap();
+        let names: Vec<_> = chosen.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["prod", "prod"]);
+        assert!(chosen.iter().all(|t| t.item == "item-prod"));
+
+        let err = select_targets(&targets, Some("prod-"), false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no matching target"));
+        assert!(!msg.contains("vault-"));
+        assert!(!msg.contains("item-"));
+    }
+
+    #[test]
+    fn all_keeps_config_order_and_empty_selection_fails_closed() {
+        let targets = vec![target("on-demand"), target("scheduled")];
+        let chosen = select_targets(&targets, None, true).unwrap();
+        let names: Vec<_> = chosen.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["on-demand", "scheduled"]);
+
+        let err = select_targets(&targets, None, false).unwrap_err();
+        assert!(format!("{err:#}").contains("pass a target name, or --all"));
+
+        let err = select_targets(&[], Some("prod"), true).unwrap_err();
+        assert!(format!("{err:#}").contains("no matching target"));
+
+        let err = select_targets(&targets, Some(""), false).unwrap_err();
+        assert!(format!("{err:#}").contains("no matching target"));
+    }
 }
