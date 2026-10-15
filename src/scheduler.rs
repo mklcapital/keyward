@@ -428,4 +428,61 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn load_rejects_a_next_run_that_is_not_a_timestamp() {
+        // Valid JSON with a bad instant must not load as "due now" or as an
+        // empty plan the loop could re-roll. Fail closed instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        std::fs::write(
+            &path,
+            r#"{"next_run":{"prod":"tomorrow"},"last_run":{}}"#,
+        )
+        .unwrap();
+        let err = State::load(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parsing state"), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn run_loop_does_not_fire_before_the_scheduled_instant() {
+        // Every other loop test pre-seeds a next_run in the past, so deleting
+        // the sleep would still pass. This one is in the future: the hook must
+        // stay idle across a short advance and fire only once that instant is
+        // reached.
+        let cfg = cfg_with(vec![("t", Some(sched("30d", "0s")))]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let mut state = State::default();
+        state.next_run.insert("t".into(), Utc::now() + chrono::Duration::hours(2));
+        state.save(&path).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = CountingHook { count: count.clone(), fired: fired.clone() };
+        let path_for_run = path.clone();
+        let task = tokio::spawn(async move { run(&cfg, &path_for_run, &hook, Some(1)).await });
+
+        tokio::task::yield_now().await;
+        let wall = std::time::Instant::now();
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        assert!(
+            wall.elapsed() < std::time::Duration::from_secs(2),
+            "tokio clock was not paused; refusing to wait on wall time"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0, "rotated before next_run");
+        assert!(fired.lock().unwrap().is_empty());
+        let mid = State::load(&path).unwrap();
+        assert!(!mid.last_run.contains_key("t"));
+        assert!(mid.next_run["t"] > Utc::now() + chrono::Duration::minutes(30));
+
+        tokio::time::advance(std::time::Duration::from_secs(3 * 60 * 60)).await;
+        let n = task.await.unwrap().unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&*fired.lock().unwrap(), &vec!["t".to_string()]);
+        let after = State::load(&path).unwrap();
+        assert!(after.last_run.contains_key("t"));
+        assert!(after.next_run["t"] > Utc::now() + chrono::Duration::days(29));
+    }
 }
