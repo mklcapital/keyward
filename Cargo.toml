@@ -40,6 +40,9 @@ ring = "0.17"
 [dev-dependencies]
 tempfile = "3"
 humantime = "2"
+# `test-util` pauses tokio's clock so scheduler tests can prove a future
+# next_run actually waits. Dev-only: `cargo build` does not enable it.
+tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
 
 [profile.release]
 strip = true
