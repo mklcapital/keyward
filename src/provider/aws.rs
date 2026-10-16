@@ -990,4 +990,101 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn iam_user_metacharacters_cannot_inject_another_action() {
+        // `iam_user` comes from the management credential. If the form body were
+        // concatenated raw, a value containing `&` / `=` would add a second
+        // Action to the signed request.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let mut cred = mgmt();
+        cred.extra.insert("iam_user".into(), "svc&Action=CreateUser&UserName=root".into());
+
+        prov.list_keys(&cred).await.unwrap();
+
+        let body = prov.transport.last().body;
+        assert!(
+            body.contains("UserName=svc%26Action%3DCreateUser%26UserName%3Droot"),
+            "{body}"
+        );
+        assert!(!body.contains("UserName=svc&"), "{body}");
+        assert!(!body.contains("&Action=CreateUser"), "{body}");
+        assert!(!body.contains("EXAMPLEKEY"), "secret must not be a form field: {body}");
+    }
+
+    #[tokio::test]
+    async fn empty_iam_user_does_not_mint_or_revoke() {
+        // An empty extra is the same footgun as a missing one: IAM would
+        // otherwise CreateAccessKey / UpdateAccessKey against the caller.
+        let fake = FakeTransport::new(vec![]);
+        let prov = Aws::with_transport(fake);
+        let mut cred = Credential::new("AKIA", "secret");
+        cred.extra.insert("iam_user".into(), "".into());
+
+        let create_err = prov.create_key(&cred, "kw", None).await.unwrap_err();
+        assert!(create_err.to_string().contains("iam_user"), "got: {create_err}");
+        let revoke_err = prov.revoke_key(&cred, "AKIAOLD").await.unwrap_err();
+        assert!(revoke_err.to_string().contains("iam_user"), "got: {revoke_err}");
+        assert!(
+            prov.transport.seen().is_empty(),
+            "empty iam_user must not reach IAM"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_token_is_signed_on_the_iam_request_and_kept_out_of_the_body() {
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let mut cred = mgmt();
+        let token = "FwoGZXIvYXdz-session-token";
+        cred.extra.insert("session_token".into(), token.into());
+
+        prov.list_keys(&cred).await.unwrap();
+
+        let req = prov.transport.last();
+        assert!(
+            req.headers.iter().any(|(k, v)| k == "x-amz-security-token" && v == token),
+            "temporary credentials must send the session token"
+        );
+        let auth = req.headers.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        assert!(
+            auth.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token"),
+            "session token must be part of the signature: {auth}"
+        );
+        assert!(!req.body.contains(token), "session token must not be a form field: {}", req.body);
+        assert!(!req.body.contains("EXAMPLEKEY"), "secret leaked into the body: {}", req.body);
+    }
+
+    #[tokio::test]
+    async fn create_key_above_the_cap_deletes_only_the_oldest_inactive_key() {
+        // Three keys can show up in a list (the cap is what we enforce, not what
+        // a stale response might contain). Make-room deletes one key: the oldest
+        // inactive. The newer inactive key is the grace-window rollback anchor.
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIANEWER", "Inactive", "2026-05-01T00:00:00Z"),
+                    ("AKIAACTIVE", "Active", "2026-06-01T00:00:00Z"),
+                    ("AKIAOLDER", "Inactive", "2026-01-01T00:00:00Z"),
+                ]),
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, one delete, create");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIAOLDER"), "got: {}", seen[1].body);
+        assert!(
+            !seen.iter().any(|r| r.body.contains("AKIANEWER") || r.body.contains("AKIAACTIVE")),
+            "must not delete the live key or the newer inactive key: {:?}",
+            seen.iter().map(|r| r.body.clone()).collect::<Vec<_>>()
+        );
+    }
 }

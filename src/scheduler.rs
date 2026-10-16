@@ -428,4 +428,41 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[tokio::test]
+    async fn run_refuses_an_unreadable_state_file_instead_of_rescheduling() {
+        // A permissions error is not a first run. Treating it as an empty
+        // schedule would drop the persisted next_run and could fire a rotation
+        // the operator had already planned.
+        use std::os::unix::fs::PermissionsExt;
+
+        let cfg = cfg_with(vec![("t", Some(sched("30d", "0s")))]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let planned = Utc::now() + chrono::Duration::days(10);
+        let mut state = State::default();
+        state.next_run.insert("t".into(), planned);
+        state.save(&path).unwrap();
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let hook = CountingHook {
+            count: count.clone(),
+            fired: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let err = run(&cfg, &path, &hook, Some(1)).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("reading state"), "{msg}");
+        assert!(!msg.contains("parsing state"), "unreadable must not be treated as JSON: {msg}");
+        assert_eq!(count.load(Ordering::SeqCst), 0, "hook must not fire");
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded.next_run.get("t"), Some(&planned));
+    }
 }

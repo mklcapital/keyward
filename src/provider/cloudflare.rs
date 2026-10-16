@@ -577,4 +577,55 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_key_without_token_id_fails_closed() {
+        // A value with no id must not be stored under an empty access-key id.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "value": "raw-token-secret", "name": "kw" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no `id`"), "{msg}");
+        assert!(!msg.contains("raw-token-secret"), "token value leaked into the error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn verify_key_does_not_send_the_derived_secret_when_the_token_value_is_missing() {
+        // `cred.secret` is hex(sha256(token)), not the bearer the verify endpoint
+        // expects. Missing cf_token_value must fail before any request.
+        let fake = FakeTransport::new(vec![]);
+        let prov = Cloudflare::with_transport(fake);
+        let mut cred = Credential::new("tok-id", "derived-s3-secret");
+        cred.extra.insert("account_id".into(), "acct-123".into());
+
+        let err = prov.verify_key(&cred).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cf_token_value"), "{msg}");
+        assert!(!msg.contains("derived-s3-secret"), "derived secret leaked into the error: {msg}");
+        assert!(
+            prov.transport.seen.lock().unwrap().is_empty(),
+            "verify must not call Cloudflare without the token value"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_error_does_not_echo_a_token_value_from_the_result() {
+        let secret = "raw-token-must-not-leak";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({
+                "success": false,
+                "errors": [],
+                "result": { "id": "tok", "value": secret }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no error detail"), "{msg}");
+        assert!(!msg.contains(secret), "token value leaked into the error: {msg}");
+    }
 }
