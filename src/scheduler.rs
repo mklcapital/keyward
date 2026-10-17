@@ -428,4 +428,59 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[tokio::test]
+    async fn run_loop_fires_only_the_soonest_due_target() {
+        // Two targets are already overdue. A one-iteration cap must rotate the
+        // earlier next_run and leave the later target's persisted plan untouched.
+        let cfg = cfg_with(vec![
+            ("late", Some(sched("30d", "0s"))),
+            ("early", Some(sched("30d", "0s"))),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let now = Utc::now();
+        let early_at = now - chrono::Duration::seconds(30);
+        let late_at = now - chrono::Duration::seconds(5);
+
+        let mut state = State::default();
+        state.next_run.insert("early".into(), early_at);
+        state.next_run.insert("late".into(), late_at);
+        state.save(&path).unwrap();
+
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = CountingHook {
+            count: Arc::new(AtomicUsize::new(0)),
+            fired: fired.clone(),
+        };
+
+        let n = run(&cfg, &path, &hook, Some(1)).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&*fired.lock().unwrap(), &vec!["early".to_string()]);
+
+        let after = State::load(&path).unwrap();
+        assert_eq!(after.next_run["late"], late_at, "a later target must not be rescheduled");
+        assert!(!after.last_run.contains_key("late"));
+        assert!(after.last_run.contains_key("early"));
+        assert!(after.next_run["early"] > Utc::now() + chrono::Duration::days(29));
+    }
+
+    #[test]
+    fn load_keeps_a_valid_plan_when_last_run_is_absent() {
+        // Older state files, and files written by a newer keyward, must still
+        // resume. Refusing to load would re-roll jitter or stop the fleet.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        std::fs::write(
+            &path,
+            r#"{"next_run":{"t":"2026-01-02T03:04:05Z"},"extra":true}"#,
+        )
+        .unwrap();
+        let s = State::load(&path).unwrap();
+        assert!(s.last_run.is_empty());
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(s.next_run["t"], expected);
+    }
 }
