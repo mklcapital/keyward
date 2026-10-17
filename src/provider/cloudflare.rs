@@ -577,4 +577,46 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn missing_success_flag_does_not_mint_or_echo_the_token() {
+        // `success` absent is not success. A token value sitting in `result`
+        // must not be returned or copied into the error.
+        let secret = "raw-token-must-not-leak";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({ "errors": [], "result": { "id": "tok", "value": secret } }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no error detail"), "{msg}");
+        assert!(!msg.contains(secret), "token value leaked into the error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn list_keys_treats_a_non_array_result_as_no_keys() {
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "not-a-list" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let keys = prov.list_keys(&mgmt()).await.unwrap();
+        assert!(keys.is_empty(), "a non-array result must not be read as one token");
+    }
+
+    #[tokio::test]
+    async fn verify_key_rejects_status_that_is_not_exactly_active() {
+        let mut cred = Credential::new("tok", "s3-secret");
+        cred.extra.insert("account_id".into(), "acct-123".into());
+        cred.extra.insert("cf_token_value".into(), "raw-token-secret".into());
+        let prov = Cloudflare::with_transport(FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok", "status": "Active" })),
+        )]));
+        let err = prov.verify_key(&cred).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not active"), "{msg}");
+        assert!(!msg.contains("raw-token-secret"), "token value leaked into the error: {msg}");
+    }
 }

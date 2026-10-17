@@ -990,4 +990,108 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn redirect_status_is_not_a_successful_key_list() {
+        // A 3xx is not a key list, even when the body looks like ListAccessKeys.
+        // Treating it as success would let a redirect or proxy page drive make-room.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            302,
+            &list_keys_xml(&[("AKIAREDIRECT", "Inactive", "2020-01-01T00:00:00Z")]),
+        )]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.list_keys(&mgmt()).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 302"), "{msg}");
+        assert!(!msg.contains("AKIAREDIRECT"), "listed key id leaked into the error: {msg}");
+        assert_eq!(prov.transport.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_make_room_delete_does_not_mint() {
+        let secret = "should-not-be-minted";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIAACTIVE", "Active", "2026-06-01T00:00:00Z"),
+                    ("AKIASTALE", "Inactive", "2026-01-01T00:00:00Z"),
+                ]),
+            ),
+            FakeTransport::ok(500, &error_xml("AccessDenied", "not allowed to delete")),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 500"), "{msg}");
+        assert!(msg.contains("AccessDenied"), "{msg}");
+        assert!(!msg.contains(secret), "unminted secret leaked into the error: {msg}");
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list then failed delete; create must not run");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIASTALE"));
+        assert!(seen[1].body.contains("Version=2010-05-08"));
+        assert!(!seen[1].body.contains("AKIAACTIVE"));
+        assert!(!seen.iter().any(|r| r.body.contains("Action=CreateAccessKey")));
+    }
+
+    #[tokio::test]
+    async fn verify_request_includes_the_sts_version_and_not_the_secret() {
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            &caller_identity_xml("arn:aws:iam::123456789012:user/svc-backups"),
+        )]);
+        let prov = Aws::with_transport(fake);
+        prov.verify_key(&Credential::new("AKIANEW", secret)).await.unwrap();
+
+        let req = prov.transport.last();
+        assert_eq!(req.url, STS_ENDPOINT);
+        assert!(req.body.contains("Action=GetCallerIdentity"));
+        assert!(req.body.contains("Version=2011-06-15"), "got body {}", req.body);
+        assert!(!req.body.contains(secret), "secret leaked into the STS body");
+        assert!(
+            req.headers.iter().all(|(_, v)| !v.contains(secret)),
+            "secret leaked into a signed header"
+        );
+    }
+
+    #[test]
+    fn signing_uses_the_bare_host_and_rejects_a_schemeless_endpoint() {
+        use chrono::TimeZone;
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let headers = sigv4::sign_query_post(
+            "https://iam.amazonaws.com/not-the-host",
+            "iam",
+            "us-east-1",
+            "AKIDEXAMPLE",
+            secret,
+            None,
+            "Action=ListAccessKeys&Version=2010-05-08",
+            now,
+        )
+        .unwrap();
+        let host = headers.iter().find(|(k, _)| k == "host").unwrap().1.clone();
+        assert_eq!(host, "iam.amazonaws.com");
+        assert!(headers.iter().all(|(_, v)| !v.contains(secret)));
+        assert!(headers.iter().all(|(_, v)| !v.contains("not-the-host")));
+
+        let err = sigv4::sign_query_post(
+            "iam.amazonaws.com",
+            "iam",
+            "us-east-1",
+            "AKIDEXAMPLE",
+            secret,
+            None,
+            "Action=ListAccessKeys",
+            now,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid endpoint"), "{msg}");
+        assert!(!msg.contains(secret), "secret leaked into the signing error: {msg}");
+    }
 }

@@ -328,4 +328,15 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn garbage_identity_is_rejected() {
+        let err = match KeyPair::from_identity_str("AGE-SECRET-KEY-1not-a-real-key") {
+            Err(err) => err,
+            Ok(_) => panic!("garbage identity was accepted"),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid age identity"), "{msg}");
+        assert!(KeyPair::from_identity_str("").is_err());
+    }
 }
