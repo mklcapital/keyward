@@ -428,4 +428,64 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[tokio::test]
+    async fn run_loop_reschedules_a_long_overdue_target_from_the_fire_time() {
+        // A target overdue by 20 days must be rescheduled a full interval from
+        // the fire, not from the missed slot (that would come due again in ~10
+        // days and bunch the fleet).
+        let cfg = cfg_with(vec![("t", Some(sched("30d", "0s")))]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let missed = Utc::now() - chrono::Duration::days(20);
+        let mut state = State::default();
+        state.next_run.insert("t".into(), missed);
+        state.save(&path).unwrap();
+
+        let hook = CountingHook {
+            count: Arc::new(AtomicUsize::new(0)),
+            fired: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let n = run(&cfg, &path, &hook, Some(1)).await.unwrap();
+        assert_eq!(n, 1);
+
+        let after = State::load(&path).unwrap();
+        let now = Utc::now();
+        let hours = (after.next_run["t"] - now).num_hours();
+        assert!(hours > 29 * 24, "next run is only {hours}h out; missed slot was reused");
+        assert!(hours < 31 * 24, "next run is {hours}h out");
+        let last = after.last_run["t"];
+        assert!((now - last).num_seconds().abs() < 120, "last_run was not the fire time");
+    }
+
+    #[tokio::test]
+    async fn run_loop_breaks_an_equal_deadline_by_target_name() {
+        // Two overdue targets share a deadline. One iteration must fire the
+        // lexicographically earlier name, not whichever target was listed first.
+        let cfg = cfg_with(vec![
+            ("zeta", Some(sched("30d", "0s"))),
+            ("alpha", Some(sched("30d", "0s"))),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let due = Utc::now() - chrono::Duration::seconds(5);
+        let mut state = State::default();
+        state.next_run.insert("zeta".into(), due);
+        state.next_run.insert("alpha".into(), due);
+        state.save(&path).unwrap();
+
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = CountingHook {
+            count: Arc::new(AtomicUsize::new(0)),
+            fired: fired.clone(),
+        };
+        let n = run(&cfg, &path, &hook, Some(1)).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&*fired.lock().unwrap(), &vec!["alpha".to_string()]);
+
+        let after = State::load(&path).unwrap();
+        assert_eq!(after.next_run["zeta"], due, "the other target must keep its deadline");
+        assert!(!after.last_run.contains_key("zeta"));
+        assert!(after.last_run.contains_key("alpha"));
+    }
 }

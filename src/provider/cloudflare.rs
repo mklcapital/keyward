@@ -577,4 +577,29 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_key_authenticates_as_the_manager_and_keeps_the_token_value() {
+        // The mint call is authorized with the management token. The raw token
+        // value comes back in the response and has to be retained for verify;
+        // it must not be sent as the bearer or written into the request body.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": "raw-token-secret", "name": "kw" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+
+        assert_eq!(cred.extra.get("cf_token_value").map(String::as_str), Some("raw-token-secret"));
+        assert_ne!(cred.secret, "raw-token-secret");
+        assert_ne!(cred.secret, "mgmt-token-value");
+
+        let req = prov.transport.last();
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        assert!(!req.url.contains("mgmt-token-value"));
+        assert!(!req.url.contains("raw-token-secret"));
+        let body = req.body.unwrap().to_string();
+        assert!(!body.contains("mgmt-token-value"), "management token leaked into the body: {body}");
+        assert!(!body.contains("raw-token-secret"), "new token value leaked into the request: {body}");
+    }
 }

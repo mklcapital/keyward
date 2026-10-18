@@ -990,4 +990,124 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn create_key_without_an_id_does_not_echo_the_secret() {
+        // A secret with no AccessKeyId must not be stored, and the error must
+        // not quote the secret (the response body is the only place it exists).
+        let secret = "wJalrXUtnFEMI/LEAKEDSECRETKEY";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(
+                200,
+                &format!(
+                    "<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey>\
+                     <SecretAccessKey>{secret}</SecretAccessKey><Status>Active</Status>\
+                     </AccessKey></CreateAccessKeyResult></CreateAccessKeyResponse>"
+                ),
+            ),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("AccessKeyId"), "got: {msg}");
+        assert!(!msg.contains(secret), "secret leaked into the error: {msg}");
+        assert_eq!(prov.transport.seen().len(), 2, "must not keep calling after a rejected mint");
+    }
+
+    #[tokio::test]
+    async fn listed_username_does_not_retarget_make_room() {
+        // ListAccessKeys echoes a UserName. That metadata must not become the
+        // user we delete or mint against — the management credential decides.
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                "<ListAccessKeysResponse><ListAccessKeysResult><AccessKeyMetadata>\
+                 <member><UserName>admin</UserName><AccessKeyId>AKIAACTIVE</AccessKeyId>\
+                 <Status>Active</Status><CreateDate>2026-06-01T00:00:00Z</CreateDate></member>\
+                 <member><UserName>admin</UserName><AccessKeyId>AKIASTALE</AccessKeyId>\
+                 <Status>Inactive</Status><CreateDate>2026-01-01T00:00:00Z</CreateDate></member>\
+                 </AccessKeyMetadata></ListAccessKeysResult></ListAccessKeysResponse>",
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.extra.get("iam_user").map(String::as_str), Some("svc-backups"));
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete, create");
+        for req in &seen {
+            assert!(
+                req.body.contains("UserName=svc-backups"),
+                "request must target the configured user: {}",
+                req.body
+            );
+            assert!(!req.body.contains("UserName=admin"), "list payload retargeted the call: {}", req.body);
+            let auth = req
+                .headers
+                .iter()
+                .find(|(k, _)| k == "authorization")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            assert!(
+                auth.contains("Credential=AKIAEXAMPLEMGMT/"),
+                "must sign as the management key, got {auth}"
+            );
+            assert!(!auth.contains("AKIAACTIVE") && !auth.contains("AKIASTALE"), "listed key signed the call: {auth}");
+        }
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIASTALE"));
+        assert!(!seen[1].body.contains("AKIAACTIVE"));
+    }
+
+    #[tokio::test]
+    async fn verify_signature_is_produced_from_the_new_secret() {
+        // The credential scope names the new key id. The signature itself has to
+        // be the one that secret produces — a stand-in secret would still pass a
+        // mock that only checks the key id.
+        let secret = "new-secret-not-the-manager";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            &caller_identity_xml("arn:aws:iam::123456789012:user/svc-backups"),
+        )]);
+        let prov = Aws::with_transport(fake);
+        prov.verify_key(&Credential::new("AKIANEW", secret)).await.unwrap();
+
+        let req = prov.transport.last();
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let body = sigv4::encode_form(&[("Action", "GetCallerIdentity"), ("Version", STS_API_VERSION)]);
+        let signed = sigv4::sign_query_post(
+            STS_ENDPOINT,
+            "sts",
+            AWS_REGION,
+            "AKIANEW",
+            secret,
+            None,
+            &body,
+            now,
+        )
+        .unwrap();
+        let other = sigv4::sign_query_post(
+            STS_ENDPOINT,
+            "sts",
+            AWS_REGION,
+            "AKIANEW",
+            "different-secret",
+            None,
+            &body,
+            now,
+        )
+        .unwrap();
+        let auth = req.headers.iter().find(|(k, _)| k == "authorization").unwrap().1.as_str();
+        let expect = signed.iter().find(|(k, _)| k == "authorization").unwrap().1.as_str();
+        let wrong = other.iter().find(|(k, _)| k == "authorization").unwrap().1.as_str();
+        assert_eq!(req.body, body);
+        assert_eq!(auth, expect, "STS must be signed with the new key's secret");
+        assert_ne!(auth, wrong, "a different secret must not verify");
+        assert!(!auth.contains(secret));
+    }
 }
