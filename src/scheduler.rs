@@ -428,4 +428,61 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn persisted_next_run_survives_an_interval_change() {
+        // A restart must not re-roll jitter, and editing the interval must not
+        // pull an already-scheduled rotation forward. A newly added target
+        // still gets its own slot.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let now = Utc::now();
+        let mut state = State::default();
+        let original = cfg_with(vec![("t", Some(sched("30d", "10d")))]);
+        let first = plan(&original, &mut state, now, &mut rng)[0].next_run;
+
+        let tightened = cfg_with(vec![
+            ("t", Some(sched("1h", "0s"))),
+            ("new", Some(sched("1d", "0s"))),
+        ]);
+        let plan2 = plan(&tightened, &mut state, now, &mut rng);
+        let kept = plan2.iter().find(|p| p.target == "t").unwrap();
+        let added = plan2.iter().find(|p| p.target == "new").unwrap();
+        assert_eq!(kept.next_run, first);
+        assert!(!kept.freshly_scheduled, "a tighter interval must not move a persisted slot");
+        assert!(added.freshly_scheduled);
+        assert_ne!(added.next_run, first);
+    }
+
+    #[test]
+    fn keyward_state_env_is_the_state_path() {
+        struct Restore<'a> {
+            key: &'a str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("operator-state.json");
+        let _restore = Restore {
+            key: "KEYWARD_STATE",
+            previous: std::env::var_os("KEYWARD_STATE"),
+        };
+        std::env::set_var("KEYWARD_STATE", &custom);
+        assert_eq!(default_state_path(), custom);
+
+        std::env::remove_var("KEYWARD_STATE");
+        let fallback = default_state_path();
+        assert!(
+            fallback.ends_with("keyward/schedule.json"),
+            "default path was {fallback:?}"
+        );
+        assert_ne!(fallback, custom);
+    }
 }

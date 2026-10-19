@@ -364,6 +364,10 @@ mod tests {
         fn last(&self) -> HttpRequest {
             self.seen.lock().unwrap().last().cloned().expect("a request was made")
         }
+
+        fn seen(&self) -> Vec<HttpRequest> {
+            self.seen.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -576,5 +580,28 @@ mod tests {
         let prov = Cloudflare::with_transport(fake);
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn http_error_does_not_mint_when_the_body_claims_success() {
+        // Status is checked before `success`. A 403 that still carries a token
+        // value must not become a credential, and the value must not be echoed.
+        let secret = "raw-token-should-not-leak";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            403,
+            json!({
+                "success": true,
+                "errors": [{ "code": 9109, "message": "Unauthorized" }],
+                "result": { "id": "tok-new", "value": secret }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 403"), "{msg}");
+        assert!(msg.contains("9109"), "{msg}");
+        assert!(!msg.contains(secret), "token value leaked into the error: {msg}");
+        assert!(!msg.contains("tok-new"), "{msg}");
+        assert_eq!(prov.transport.seen().len(), 1, "a rejected mint must not be retried");
     }
 }

@@ -990,4 +990,93 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn create_key_under_the_cap_keeps_a_lone_inactive_key() {
+        // One inactive key is the grace-window rollback anchor, and IAM still
+        // has a free slot. Make-room runs only at the 2-key cap, so this key
+        // must survive the mint.
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[("AKIASTALE", "Inactive", "2026-01-01T00:00:00Z")]),
+            ),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, "brand-new-secret");
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list then create; the inactive key stays");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=CreateAccessKey"));
+        assert!(
+            seen.iter().all(|r| !r.body.contains("DeleteAccessKey") && !r.body.contains("AKIASTALE")),
+            "a lone inactive key must not be deleted: {:?}",
+            seen.iter().map(|r| r.body.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_response_username_does_not_replace_the_target_user() {
+        // CreateAccessKey echoes a UserName. That echo must not retarget the
+        // stored credential or a follow-up call onto a different IAM user.
+        let secret = "wJalrXUtnFEMI/NEWSECRETKEY";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[])),
+            FakeTransport::ok(
+                200,
+                &format!(
+                    "<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey>\
+                     <UserName>admin</UserName><AccessKeyId>AKIANEW</AccessKeyId>\
+                     <Status>Active</Status><SecretAccessKey>{secret}</SecretAccessKey>\
+                     <CreateDate>2026-07-07T12:00:00Z</CreateDate></AccessKey>\
+                     </CreateAccessKeyResult></CreateAccessKeyResponse>"
+                ),
+            ),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+        assert_eq!(cred.extra.get("iam_user").map(String::as_str), Some("svc-backups"));
+
+        let seen = prov.transport.seen();
+        assert!(seen.iter().all(|r| r.body.contains("UserName=svc-backups")), "{:?}", seen);
+        assert!(
+            seen.iter().all(|r| !r.body.contains("UserName=admin") && !r.body.contains(secret)),
+            "create echo retargeted the call or leaked the secret: {:?}",
+            seen.iter().map(|r| r.body.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn form_encoding_keeps_unreserved_characters_and_uppercases_hex() {
+        // AWS rejects a signature if `~` is percent-encoded or hex is lowercase.
+        let body = sigv4::encode_form(&[("UserName", "svc~backup.user_1"), ("Action", "a*b")]);
+        assert_eq!(body, "UserName=svc~backup.user_1&Action=a%2Ab");
+    }
+
+    #[test]
+    fn signing_keeps_an_explicit_port_on_the_host() {
+        use chrono::TimeZone;
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let headers = sigv4::sign_query_post(
+            "https://iam.amazonaws.com:443/ignored",
+            "iam",
+            "us-east-1",
+            "AKIDEXAMPLE",
+            secret,
+            None,
+            "Action=ListAccessKeys&Version=2010-05-08",
+            now,
+        )
+        .unwrap();
+        let host = headers.iter().find(|(k, _)| k == "host").map(|(_, v)| v.clone());
+        assert_eq!(host.as_deref(), Some("iam.amazonaws.com:443"));
+        assert!(headers.iter().all(|(_, v)| !v.contains(secret) && !v.contains("ignored")));
+    }
 }
