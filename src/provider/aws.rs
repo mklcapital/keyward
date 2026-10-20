@@ -990,4 +990,83 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn plus_in_the_iam_user_cannot_be_read_as_a_space() {
+        // `+` is legal in an IAM user name. Leaving it raw (or encoding a space
+        // as `+`) would make SigV4 sign a different user than the one IAM parses.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let mut cred = mgmt();
+        let secret = cred.secret.clone();
+        cred.extra.insert("iam_user".into(), "svc+backups".into());
+
+        prov.list_keys(&cred).await.unwrap();
+
+        let body = prov.transport.last().body;
+        assert!(body.contains("UserName=svc%2Bbackups"), "{body}");
+        assert!(!body.contains("UserName=svc+backups"), "{body}");
+        assert!(!body.contains("UserName=svc backups"), "{body}");
+        assert!(!body.contains(&secret), "signing secret must not be a form field: {body}");
+    }
+
+    #[tokio::test]
+    async fn equal_create_dates_delete_only_the_earlier_inactive_key() {
+        // CreateDate is second resolution, so a tie is real. Stable order must
+        // free exactly one slot: the first Inactive key, never the Active key
+        // that shares the timestamp, and never both inactive keys.
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIALIVE", "Active", "2026-03-01T00:00:00Z"),
+                    ("AKIAFIRST", "Inactive", "2026-03-01T00:00:00Z"),
+                    ("AKIASECOND", "Inactive", "2026-03-01T00:00:00Z"),
+                ]),
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, "brand-new-secret");
+
+        let seen = prov.transport.seen();
+        let deletes: Vec<_> = seen
+            .iter()
+            .filter(|req| req.body.contains("Action=DeleteAccessKey"))
+            .collect();
+        assert_eq!(deletes.len(), 1, "a date tie must free one slot, not every match");
+        assert!(deletes[0].body.contains("AccessKeyId=AKIAFIRST"), "{}", deletes[0].body);
+        assert!(!deletes[0].body.contains("AKIALIVE"), "must not delete the Active key: {}", deletes[0].body);
+        assert!(
+            !deletes[0].body.contains("AKIASECOND"),
+            "must not delete the later inactive key: {}",
+            deletes[0].body
+        );
+        assert!(!deletes[0].body.contains(&mgmt().secret), "{}", deletes[0].body);
+        assert_eq!(
+            seen.iter().filter(|req| req.body.contains("Action=CreateAccessKey")).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_iam_error_does_not_echo_the_signing_secret() {
+        let secret = "wJalrXUtnFEMI/SUPERSECRETKEY";
+        let mut cred = mgmt();
+        cred.secret = secret.to_string();
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            403,
+            &error_xml("AccessDenied", "User is not authorized to perform iam:ListAccessKeys"),
+        )]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.list_keys(&cred).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 403"), "{msg}");
+        assert!(msg.contains("AccessDenied"), "{msg}");
+        assert!(!msg.contains(secret), "signing secret leaked into the error: {msg}");
+        assert!(!msg.contains("SUPERSECRET"), "{msg}");
+    }
 }

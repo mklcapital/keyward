@@ -428,4 +428,15 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn jitter_that_cancels_the_interval_lands_on_the_base_instant() {
+        // The lower end of U(-jitter, +jitter) is the clamp boundary. A full
+        // negative offset must schedule at `base`, not one millisecond before it,
+        // or the loop would treat the slot as already due and spin.
+        let mut rng = rand::rngs::mock::StepRng::new(0, 0);
+        let base = Utc::now();
+        let next = next_run_from(base, &sched("1h", "1h"), &mut rng);
+        assert_eq!(next, base);
+    }
 }
