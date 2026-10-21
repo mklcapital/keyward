@@ -990,4 +990,65 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn revoke_key_encodes_access_key_id_metacharacters() {
+        // UpdateAccessKey puts the key id in the signed form body next to
+        // Status=Inactive. A raw `&`, `=`, or `%` would add another field or
+        // decode into Status=Active, undoing the deactivation.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, "")]);
+        let prov = Aws::with_transport(fake);
+        prov.revoke_key(&mgmt(), "AK%&Status=Active").await.unwrap();
+
+        let req = prov.transport.last();
+        let body = req.body;
+        assert!(body.contains("Action=UpdateAccessKey"), "{body}");
+        assert!(body.contains("UserName=svc-backups"), "{body}");
+        assert!(
+            body.contains("AccessKeyId=AK%25%26Status%3DActive"),
+            "{body}"
+        );
+        assert_eq!(body.matches("Status=").count(), 1, "{body}");
+        assert!(body.contains("Status=Inactive"), "{body}");
+        assert!(!body.contains("Status=Active"), "{body}");
+        assert!(!body.contains("AccessKeyId=AK%&"), "{body}");
+        assert!(!body.contains("EXAMPLEKEY"), "signing secret must not be a form field: {body}");
+        assert!(req.headers.iter().all(|(_, v)| !v.contains("EXAMPLEKEY")));
+    }
+
+    #[tokio::test]
+    async fn make_room_encodes_the_inactive_key_id_and_leaves_the_active_key() {
+        // The destructive make-room delete uses the same form body. The victim
+        // id must be encoded, and the live key's id must not become UserName.
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIAACTIVE", "Active", "2026-06-01T00:00:00Z"),
+                    ("AK%&UserName=root", "Inactive", "2026-01-01T00:00:00Z"),
+                ]),
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, "brand-new-secret");
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete, create");
+        let delete = &seen[1].body;
+        assert!(delete.contains("Action=DeleteAccessKey"), "{delete}");
+        assert!(
+            delete.contains("AccessKeyId=AK%25%26UserName%3Droot"),
+            "{delete}"
+        );
+        assert!(delete.contains("UserName=svc-backups"), "{delete}");
+        assert!(!delete.contains("UserName=root"), "{delete}");
+        assert!(!delete.contains("AccessKeyId=AKIAACTIVE"), "{delete}");
+        assert!(!delete.contains("EXAMPLEKEY"), "{delete}");
+        assert!(!seen[2].body.contains("brand-new-secret"), "new secret must not be echoed in the create body");
+        assert!(!seen[2].body.contains("EXAMPLEKEY"));
+    }
 }

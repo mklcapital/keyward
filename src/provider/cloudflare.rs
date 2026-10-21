@@ -504,6 +504,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_key_rejects_active_status_with_whitespace() {
+        // Only the exact string "active" is live. A trimmed or padded lookalike
+        // must fail closed, and neither token may leak into the error or URL.
+        for status in ["active ", " active", "active\n"] {
+            let fake = FakeTransport::new(vec![FakeTransport::ok(
+                200,
+                envelope(json!({ "id": "tok", "status": status })),
+            )]);
+            let prov = Cloudflare::with_transport(fake);
+            let mut cred = Credential::new("tok", "s3-derived-secret");
+            cred.extra.insert("account_id".into(), "acct-123".into());
+            cred.extra.insert("cf_token_value".into(), "raw-token-secret".into());
+
+            let err = prov.verify_key(&cred).await.unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("not active"), "{status:?} -> {msg}");
+            assert!(!msg.contains("raw-token-secret"), "{status:?} leaked token: {msg}");
+            assert!(!msg.contains("s3-derived-secret"), "{status:?} leaked secret: {msg}");
+
+            let req = prov.transport.last();
+            assert!(req.url.ends_with("/accounts/acct-123/tokens/verify"), "{}", req.url);
+            assert_eq!(req.bearer.as_deref(), Some("raw-token-secret"));
+            assert!(!req.url.contains("raw-token-secret"), "{}", req.url);
+            assert!(!req.url.contains("s3-derived-secret"), "{}", req.url);
+        }
+    }
+
+    #[tokio::test]
     async fn verify_key_rejects_disabled_token() {
         let fake = FakeTransport::new(vec![FakeTransport::ok(
             200,
