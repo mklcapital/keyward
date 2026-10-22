@@ -577,4 +577,50 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn token_name_cannot_inject_a_second_policy() {
+        // The token name is operator input. It must stay one JSON string so a
+        // quote cannot replace the read-only fallback with another permission group.
+        let name = "kw\",\"policies\":[{\"effect\":\"allow\",\"permission_groups\":[{\"id\":\"ffffffffffffffffffffffffffffffff\"}]}]\n";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": "raw-token-secret", "name": "kw" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), name, None).await.unwrap();
+        assert_eq!(cred.key_id, "tok-new");
+        assert_ne!(cred.secret, "raw-token-secret");
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let sent = req.body.expect("create body");
+        assert_eq!(sent["name"], name);
+        let policies = sent["policies"].as_array().expect("policies array");
+        assert_eq!(policies.len(), 1, "injected name must not add a policy: {sent}");
+        assert_eq!(policies[0]["effect"], "allow");
+        assert_eq!(policies[0]["permission_groups"][0]["id"], R2_READ_PERMISSION_GROUP);
+        assert!(!policies[0].to_string().contains("ffffffffffffffffffffffffffffffff"));
+        assert!(!req.url.contains("raw-token-secret"));
+        assert!(!req.url.contains("mgmt-token-value"));
+    }
+
+    #[tokio::test]
+    async fn numeric_token_value_does_not_mint() {
+        // A JSON number is not a token value. Deriving a secret from its digits
+        // would store a credential Cloudflare will never accept.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": 123456789, "name": "kw" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no `value`"), "{msg}");
+        assert!(!msg.contains("123456789"), "numeric value leaked into the error: {msg}");
+        assert!(!msg.contains("mgmt-token-value"), "management token leaked: {msg}");
+        let derived = Cloudflare::<ReqwestTransport>::derive_secret_access_key("123456789");
+        assert!(!msg.contains(&derived), "must not derive a secret from the number: {msg}");
+    }
 }
