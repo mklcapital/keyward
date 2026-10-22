@@ -990,4 +990,82 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[test]
+    fn signing_ignores_endpoint_path_and_query() {
+        // IAM Query calls are always POST /. A path or query on the endpoint
+        // must not change the canonical request: that would both break the
+        // signature and let a decorated URL smuggle an action into SigV4.
+        use chrono::TimeZone;
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let body = "Action=ListAccessKeys&Version=2010-05-08";
+        let sign = |endpoint: &str| {
+            sigv4::sign_query_post(
+                endpoint,
+                "iam",
+                "us-east-1",
+                "AKIDEXAMPLE",
+                secret,
+                None,
+                body,
+                now,
+            )
+            .unwrap()
+        };
+        let bare = sign("https://iam.amazonaws.com/");
+        let decorated = sign(
+            "https://iam.amazonaws.com/ignored?Action=DeleteUser&Version=1999-01-01",
+        );
+        let auth = |headers: &[(String, String)]| {
+            headers.iter().find(|(k, _)| k == "authorization").unwrap().1.clone()
+        };
+        let bare_auth = auth(&bare);
+        let decorated_auth = auth(&decorated);
+        assert_eq!(
+            bare_auth, decorated_auth,
+            "path and query must not enter the canonical request"
+        );
+        let sig = decorated_auth.rsplit("Signature=").next().unwrap();
+        assert_eq!(sig.len(), 64, "signature must stay 64 hex chars: {sig}");
+        let host = decorated.iter().find(|(k, _)| k == "host").unwrap().1.clone();
+        assert_eq!(host, "iam.amazonaws.com");
+        assert!(decorated.iter().all(|(_, v)| !v.contains(secret)), "signing secret leaked");
+        assert!(decorated.iter().all(|(_, v)| !v.contains("DeleteUser")));
+        assert!(decorated.iter().all(|(_, v)| !v.contains("ignored")));
+        assert!(decorated.iter().all(|(_, v)| !v.contains("1999-01-01")));
+    }
+
+    #[tokio::test]
+    async fn list_keys_keeps_the_configured_user_when_xml_names_another() {
+        // ListAccessKeys echoes a UserName per member. That echo must not become
+        // the identity we report or the user we would rotate next.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            "<ListAccessKeysResponse><ListAccessKeysResult><AccessKeyMetadata>\
+             <member><UserName>admin</UserName><AccessKeyId>AKIAA</AccessKeyId>\
+             <Status>Active</Status><CreateDate>2026-06-01T00:00:00Z</CreateDate></member>\
+             <member><UserName>root</UserName><AccessKeyId>AKIAB</AccessKeyId>\
+             <Status>Inactive</Status><CreateDate>2026-01-01T00:00:00Z</CreateDate></member>\
+             </AccessKeyMetadata></ListAccessKeysResult></ListAccessKeysResponse>",
+        )]);
+        let prov = Aws::with_transport(fake);
+        let keys = prov.list_keys(&mgmt()).await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|k| k.name.as_deref() == Some("svc-backups")), "{keys:?}");
+        assert_eq!(keys[0].key_id, "AKIAA");
+        assert_eq!(keys[0].capabilities, vec!["status:Active".to_string()]);
+        assert_eq!(keys[1].key_id, "AKIAB");
+        assert_eq!(keys[1].capabilities, vec!["status:Inactive".to_string()]);
+
+        let req = prov.transport.last();
+        assert_eq!(req.url, IAM_ENDPOINT);
+        assert!(req.body.contains("Action=ListAccessKeys"), "{}", req.body);
+        assert_eq!(req.body.matches("UserName=").count(), 1, "{}", req.body);
+        assert!(req.body.contains("UserName=svc-backups"), "{}", req.body);
+        assert!(!req.body.contains("UserName=admin"), "{}", req.body);
+        assert!(!req.body.contains("UserName=root"), "{}", req.body);
+        assert!(!req.body.contains("EXAMPLEKEY"), "signing secret must not be a form field: {}", req.body);
+        assert!(req.headers.iter().all(|(_, v)| !v.contains("EXAMPLEKEY")));
+    }
 }
