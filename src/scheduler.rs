@@ -428,4 +428,15 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn full_positive_jitter_lands_on_the_far_end_of_the_window() {
+        // StepRng(0) is the lower endpoint (clamped to `base` when jitter
+        // cancels the interval). The maximum word must reach the other end,
+        // or a fleet never spreads past `base + interval`.
+        let mut rng = rand::rngs::mock::StepRng::new(u64::MAX, 0);
+        let base = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 7, 12, 0, 0).unwrap();
+        let next = next_run_from(base, &sched("1h", "1h"), &mut rng);
+        assert_eq!(next, base + chrono::Duration::hours(2));
+    }
 }
