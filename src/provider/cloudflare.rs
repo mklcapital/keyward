@@ -577,4 +577,67 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_key_does_not_merge_a_later_broader_policy() {
+        // Scope is the first stored capability only. A second, broader policy
+        // sitting behind an unusable or narrow entry must not be appended or
+        // preferred — that would mint a token wider than the one it replaces.
+        let narrow = json!([{
+            "effect": "allow",
+            "permission_groups": [{ "id": "pg-read" }]
+        }]);
+        let admin = json!([{
+            "effect": "allow",
+            "permission_groups": [{ "id": "pg-admin-do-not-send" }]
+        }]);
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": "raw-token-secret", "name": "kw" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let like = KeyInfo {
+            key_id: "tok-old".into(),
+            name: Some("old".into()),
+            capabilities: vec![narrow.to_string(), admin.to_string()],
+            bucket_id: None,
+        };
+        let cred = prov.create_key(&mgmt(), "kw", Some(&like)).await.unwrap();
+
+        let req = prov.transport.last();
+        let sent = req.body.unwrap();
+        assert_eq!(sent["policies"], narrow);
+        let rendered = sent.to_string();
+        assert!(!rendered.contains("pg-admin-do-not-send"));
+        assert_eq!(cred.extra.get("policies").unwrap(), &narrow.to_string());
+        assert!(!cred.secret.contains("raw-token-secret"));
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        assert!(!req.url.contains("mgmt-token-value"));
+        assert!(!req.url.contains("raw-token-secret"));
+    }
+
+    #[tokio::test]
+    async fn revoke_key_fails_closed_when_the_envelope_says_so() {
+        // HTTP 200 with success:false means the old token is still live.
+        // Reporting success here would let the orchestrator drop its only
+        // record of a key that was not actually revoked.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({
+                "success": false,
+                "errors": [{ "code": 1001, "message": "token still live" }],
+                "result": { "id": "tok-old", "value": "must-not-echo" }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.revoke_key(&mgmt(), "tok-old").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("token still live"), "got: {msg}");
+        assert!(msg.contains("1001"), "got: {msg}");
+        assert!(!msg.contains("must-not-echo"), "got: {msg}");
+        assert!(!msg.contains("mgmt-token-value"), "got: {msg}");
+        let req = prov.transport.last();
+        assert_eq!(req.method, "DELETE");
+        assert!(req.url.ends_with("/accounts/acct-123/tokens/tok-old"));
+    }
 }

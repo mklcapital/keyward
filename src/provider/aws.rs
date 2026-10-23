@@ -990,4 +990,70 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn create_key_keeps_a_secret_emitted_before_the_access_key_id() {
+        // CreateAccessKey returns the secret exactly once. Field order in the
+        // XML is not a contract; a parser that only looks after AccessKeyId
+        // would store a key id and drop the secret, then the orchestrator
+        // could revoke the live key after a failed or empty verify.
+        let secret = "only+once/secret==";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(
+                200,
+                &format!(
+                    "<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey>\
+                     <UserName>admin</UserName><SecretAccessKey>{secret}</SecretAccessKey>\
+                     <Status>Active</Status><AccessKeyId>AKIANEW</AccessKeyId>\
+                     </AccessKey></CreateAccessKeyResult></CreateAccessKeyResponse>"
+                ),
+            ),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+        assert_eq!(cred.extra.get("iam_user").map(String::as_str), Some("svc-backups"));
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list then create; no delete");
+        for req in &seen {
+            assert!(!req.body.contains(secret), "mint request must not echo the new secret");
+            assert!(!req.headers.iter().any(|(_, v)| v.contains(secret)));
+            assert!(req.body.contains("UserName=svc-backups"));
+            assert!(!req.body.contains("UserName=admin"));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_create_date_still_reclaims_only_the_inactive_key() {
+        // A list member with no CreateDate sorts as the oldest string. That
+        // must not make it look Active, and it must not cause the dated live
+        // key to be deleted to free a slot.
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                "<ListAccessKeysResponse><ListAccessKeysResult><AccessKeyMetadata>\
+                 <member><UserName>svc-backups</UserName><AccessKeyId>AKIAACTIVE</AccessKeyId>\
+                 <Status>Active</Status><CreateDate>2026-06-01T00:00:00Z</CreateDate></member>\
+                 <member><UserName>svc-backups</UserName><AccessKeyId>AKIAUNDATED</AccessKeyId>\
+                 <Status>Inactive</Status></member>\
+                 </AccessKeyMetadata></ListAccessKeysResult></ListAccessKeysResponse>",
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, "brand-new-secret");
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete(make-room), create");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIAUNDATED"));
+        assert!(!seen[1].body.contains("AKIAACTIVE"), "a dated live key must survive a missing create date");
+        assert!(!seen[2].body.contains("brand-new-secret"));
+    }
 }
