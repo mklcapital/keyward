@@ -577,4 +577,53 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn stringly_success_and_unstructured_errors_do_not_mint_or_echo_the_token() {
+        // `success` is a JSON bool. The string "true" and the number 1 are not.
+        // An errors payload that is not an array of {code, message} must not be
+        // stringified into the error (that is where a token value would leak).
+        let secret = "raw-token-must-not-leak";
+        let derived = Cloudflare::<ReqwestTransport>::derive_secret_access_key(secret);
+        let cases = [
+            (
+                json!({ "success": "true", "errors": [], "result": { "id": "tok-new", "value": secret } }),
+                "no error detail",
+            ),
+            (
+                json!({ "success": 1, "errors": [], "result": { "id": "tok-new", "value": secret } }),
+                "no error detail",
+            ),
+            (
+                json!({ "success": false, "errors": secret, "result": { "id": "tok-new", "value": secret } }),
+                "no error detail",
+            ),
+            (
+                json!({
+                    "success": false,
+                    "errors": [
+                        { "code": 7, "message": "policy rejected" },
+                        { "code": "nope", "message": { "value": secret } }
+                    ],
+                    "result": { "id": "tok-new", "value": secret }
+                }),
+                "[7] policy rejected; [0] unknown error",
+            ),
+        ];
+        for (body, expect) in cases {
+            let fake = FakeTransport::new(vec![FakeTransport::ok(200, body)]);
+            let prov = Cloudflare::with_transport(fake);
+            let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains(expect), "{msg}");
+            assert!(!msg.contains(secret), "{msg}");
+            assert!(!msg.contains(&derived), "{msg}");
+            assert!(!msg.contains("mgmt-token-value"), "{msg}");
+            assert_eq!(
+                prov.transport.seen.lock().unwrap().len(),
+                1,
+                "a rejected mint must not continue"
+            );
+        }
+    }
 }
