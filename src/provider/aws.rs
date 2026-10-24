@@ -990,4 +990,110 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn iam_user_newline_cannot_split_the_signed_body() {
+        // A CR/LF in the target user must stay inside the form field. A raw
+        // newline would let the value invent another Action or a header.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let mut cred = mgmt();
+        cred.extra.insert(
+            "iam_user".into(),
+            "svc\r\nAction=CreateUser&UserName=root".into(),
+        );
+
+        prov.list_keys(&cred).await.unwrap();
+
+        let req = prov.transport.last();
+        assert!(!req.body.contains('\n') && !req.body.contains('\r'), "{}", req.body);
+        assert!(
+            req.body.contains("UserName=svc%0D%0AAction%3DCreateUser%26UserName%3Droot"),
+            "{}",
+            req.body
+        );
+        assert_eq!(req.body.matches("Action=").count(), 1, "{}", req.body);
+        assert!(req.body.contains("Action=ListAccessKeys"), "{}", req.body);
+        assert!(!req.body.contains("EXAMPLEKEY"), "signing secret in the body: {}", req.body);
+        assert!(
+            req.headers.iter().all(|(k, v)| !k.contains('\n') && !v.contains('\n') && !v.contains('\r')),
+            "user name leaked into a header: {:?}",
+            req.headers
+        );
+    }
+
+    #[tokio::test]
+    async fn create_key_keeps_the_first_secret_and_drops_a_later_decoy() {
+        // CreateAccessKey returns the secret once. A second SecretAccessKey in
+        // the same document must not replace it or land in credential extras.
+        let first = "first-secret-only+/=once";
+        let decoy = "second-decoy-secret-MUST-NOT-STORE";
+        let xml = format!(
+            "<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey>\
+             <UserName>svc-backups</UserName><AccessKeyId>AKIAREAL</AccessKeyId>\
+             <SecretAccessKey>{first}</SecretAccessKey>\
+             <SecretAccessKey>{decoy}</SecretAccessKey>\
+             </AccessKey></CreateAccessKeyResult></CreateAccessKeyResponse>"
+        );
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(200, &xml),
+        ]);
+        let prov = Aws::with_transport(fake);
+
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+
+        assert_eq!(cred.key_id, "AKIAREAL");
+        assert_eq!(cred.secret, first);
+        assert!(cred.extra.values().all(|v| !v.contains(decoy) && !v.contains(first)));
+        let create = &prov.transport.seen()[1];
+        assert!(!create.body.contains(first) && !create.body.contains(decoy), "{}", create.body);
+    }
+
+    #[tokio::test]
+    async fn status_299_lists_keys_and_300_does_not() {
+        // The success check is `status >= 300`. 299 must still parse; 300 must
+        // not be treated as a key list, and the listed id must not be echoed.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            299,
+            &list_keys_xml(&[("AKIAEDGE", "Active", "2026-01-01T00:00:00Z")]),
+        )]);
+        let prov = Aws::with_transport(fake);
+        let keys = prov.list_keys(&mgmt()).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_id, "AKIAEDGE");
+
+        let hidden = "AKIAHIDDEN";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            300,
+            &list_keys_xml(&[(hidden, "Active", "2026-01-01T00:00:00Z")]),
+        )]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.list_keys(&mgmt()).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 300"), "{msg}");
+        assert!(msg.contains("Unknown: no message"), "{msg}");
+        assert!(!msg.contains(hidden), "{msg}");
+        assert!(!msg.contains("EXAMPLEKEY"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn error_summary_does_not_echo_a_secret_outside_code_and_message() {
+        // Only <Code> and <Message> are surfaced. A secret parked in another
+        // tag (or the signing key) must not ride along in the error string.
+        let leak = "wJalr-LEAKED-SECRET";
+        let body = format!(
+            "<ErrorResponse><SecretAccessKey>{leak}</SecretAccessKey>\
+             <Error><Type>Sender</Type></Error></ErrorResponse>"
+        );
+        let fake = FakeTransport::new(vec![FakeTransport::ok(403, &body)]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.list_keys(&mgmt()).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 403"), "{msg}");
+        assert!(msg.contains("Unknown: no message"), "{msg}");
+        assert!(!msg.contains(leak), "{msg}");
+        assert!(!msg.contains("EXAMPLEKEY"), "{msg}");
+        assert!(!msg.contains("SecretAccessKey"), "{msg}");
+    }
 }
