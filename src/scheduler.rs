@@ -428,4 +428,33 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn state_save_replaces_the_file_instead_of_appending() {
+        // A second save has to overwrite. Appending would leave two JSON
+        // documents, and the next load would refuse to run the schedule.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let earlier = Utc::now();
+
+        let mut state = State::default();
+        state.next_run.insert("retired".into(), earlier);
+        state.save(&path).unwrap();
+
+        let later = Utc::now();
+        state.next_run.clear();
+        state.next_run.insert("live".into(), later);
+        state.last_run.insert("live".into(), earlier);
+        state.save(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.matches("\"next_run\"").count(), 1, "{raw}");
+        assert_eq!(raw.matches("\"last_run\"").count(), 1, "{raw}");
+        assert!(!raw.contains("retired"), "{raw}");
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded.next_run.len(), 1);
+        assert_eq!(loaded.next_run.get("live"), Some(&later));
+        assert_eq!(loaded.last_run.get("live"), Some(&earlier));
+        assert!(!loaded.next_run.contains_key("retired"));
+    }
 }
