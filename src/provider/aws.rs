@@ -990,4 +990,65 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn percent_in_the_iam_user_is_not_decoded_into_a_slash() {
+        // AWS decodes the form body once. A user whose name contains the
+        // characters %2F must be sent as %252F, or it becomes svc/root.
+        let mut cred = mgmt();
+        cred.extra.insert("iam_user".into(), "svc%2Froot".into());
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let keys = prov.list_keys(&cred).await.unwrap();
+        assert!(keys.is_empty());
+
+        let req = prov.transport.last();
+        assert!(
+            req.body.contains("UserName=svc%252Froot"),
+            "percent must be encoded again: {}",
+            req.body
+        );
+        assert!(
+            !req.body.contains("UserName=svc%2Froot"),
+            "a single decode would name a different user: {}",
+            req.body
+        );
+        assert!(!req.body.contains("UserName=svc/root"), "{}", req.body);
+        assert_eq!(req.body.matches("Action=").count(), 1, "{}", req.body);
+        assert!(req.body.contains("Action=ListAccessKeys"), "{}", req.body);
+        assert!(req.body.contains("Version=2010-05-08"), "{}", req.body);
+        let secret = "wJalrXUtnFEMI/EXAMPLEKEY";
+        assert!(!req.body.contains(secret), "{}", req.body);
+        assert!(!req.headers.iter().any(|(_, v)| v.contains(secret)));
+    }
+
+    #[tokio::test]
+    async fn attributed_tags_do_not_mint_or_echo_the_secret() {
+        // `<AccessKeyId ...>` is not the field we scan for. Accepting it would
+        // capture a secret from a tag the response author decorated.
+        let secret = "super-secret-value-once";
+        let xml = format!(
+            "<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey>\
+             <AccessKeyId id=\"decoy\">AKIAGOOD</AccessKeyId>\
+             <SecretAccessKey id=\"x\">{secret}</SecretAccessKey>\
+             </AccessKey></CreateAccessKeyResult></CreateAccessKeyResponse>"
+        );
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(200, &xml),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("missing AccessKeyId/SecretAccessKey"), "{chain}");
+        assert!(!chain.contains(secret), "{chain}");
+        assert!(!chain.contains("AKIAGOOD"), "{chain}");
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list, then the rejected create");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=CreateAccessKey"));
+        assert!(!seen.iter().any(|r| r.body.contains("Action=DeleteAccessKey")));
+        assert!(!seen.iter().any(|r| r.body.contains(secret) || r.body.contains("AKIAGOOD")));
+    }
 }

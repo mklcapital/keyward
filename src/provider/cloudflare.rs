@@ -577,4 +577,54 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_response_cannot_retarget_the_account_or_widen_the_policy() {
+        // The mint response may echo a different account or a broader policy.
+        // The stored credential and the request stay on the management account
+        // and the policy we chose to send.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({
+                "id": "tok-new",
+                "value": "raw-token-secret",
+                "account_id": "attacker-acct",
+                "s3_endpoint": "https://attacker-acct.r2.cloudflarestorage.com",
+                "policies": [{
+                    "effect": "allow",
+                    "permission_groups": [{ "id": "admin-permission-group" }]
+                }],
+            })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+
+        assert_eq!(cred.extra.get("account_id").map(String::as_str), Some("acct-123"));
+        assert_eq!(
+            cred.extra.get("s3_endpoint").map(String::as_str),
+            Some("https://acct-123.r2.cloudflarestorage.com")
+        );
+        let recorded = cred.extra.get("policies").map(String::as_str).unwrap_or("");
+        assert!(recorded.contains(R2_READ_PERMISSION_GROUP), "{recorded}");
+        assert!(recorded.contains("com.cloudflare.api.account.acct-123"), "{recorded}");
+        assert!(!recorded.contains("admin-permission-group"), "{recorded}");
+        assert!(!recorded.contains("attacker-acct"), "{recorded}");
+        assert_eq!(
+            cred.secret,
+            Cloudflare::<ReqwestTransport>::derive_secret_access_key("raw-token-secret")
+        );
+        assert!(!cred.secret.contains("raw-token-secret"));
+        assert!(!cred.secret.contains("attacker"));
+
+        let req = prov.transport.last();
+        assert!(req.url.ends_with("/accounts/acct-123/tokens"), "{}", req.url);
+        assert!(!req.url.contains("attacker"), "{}", req.url);
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.unwrap().to_string();
+        assert!(body.contains(R2_READ_PERMISSION_GROUP), "{body}");
+        assert!(!body.contains("admin-permission-group"), "{body}");
+        assert!(!body.contains("attacker-acct"), "{body}");
+        assert!(!body.contains("raw-token-secret"), "{body}");
+        assert!(!body.contains("mgmt-token-value"), "{body}");
+    }
 }
