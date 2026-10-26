@@ -364,6 +364,10 @@ mod tests {
         fn last(&self) -> HttpRequest {
             self.seen.lock().unwrap().last().cloned().expect("a request was made")
         }
+
+        fn count(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
     }
 
     #[async_trait]
@@ -576,5 +580,34 @@ mod tests {
         let prov = Cloudflare::with_transport(fake);
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn non_string_token_value_does_not_mint_or_echo() {
+        // `value` is a secret string. A bool, object, or array must not be
+        // stringified into a stored S3 secret or into the error.
+        let nested = "nested-token-value";
+        let cases = [
+            json!({ "id": "tok-new", "value": true }),
+            json!({ "id": "tok-new", "value": { "secret": nested } }),
+            json!({ "id": "tok-new", "value": [nested] }),
+        ];
+        for result in cases {
+            let fake = FakeTransport::new(vec![FakeTransport::ok(200, envelope(result))]);
+            let prov = Cloudflare::with_transport(fake);
+            let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("no `value`"), "{msg}");
+            assert!(!msg.contains(nested), "structured token leaked into the error: {msg}");
+            assert!(!msg.contains("mgmt-token-value"), "management token leaked: {msg}");
+            let derived = Cloudflare::<ReqwestTransport>::derive_secret_access_key(nested);
+            assert!(!msg.contains(&derived), "must not derive a secret from a non-string: {msg}");
+            assert!(!msg.contains("true"), "bool value must not be stringified: {msg}");
+            assert_eq!(prov.transport.count(), 1, "create is not retried after a bad value");
+            let req = prov.transport.last();
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+            assert!(!req.url.contains(nested), "{}", req.url);
+        }
     }
 }
