@@ -990,4 +990,116 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn create_key_keeps_a_multiline_secret_exactly() {
+        // The secret is returned once and may contain whitespace. Trimming or
+        // stopping at the first newline would store a credential AWS will reject,
+        // after the old key has already been revoked.
+        let secret = "line1\nline2/secret==  ";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(
+                200,
+                &format!(
+                    "<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey>\
+                     <AccessKeyId>AKIANEW</AccessKeyId>\
+                     <SecretAccessKey>{secret}</SecretAccessKey>\
+                     </AccessKey></CreateAccessKeyResult></CreateAccessKeyResponse>"
+                ),
+            ),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+        assert!(cred.secret.contains('\n'), "interior newline must survive");
+        assert!(cred.secret.ends_with("  "), "trailing spaces must survive");
+        assert_ne!(cred.secret.trim(), cred.secret);
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list then create; no delete");
+        assert!(!seen.iter().any(|r| r.body.contains("Action=DeleteAccessKey")));
+        for req in &seen {
+            assert!(!req.body.contains(secret), "mint request must not echo the new secret");
+            assert!(!req.headers.iter().any(|(_, v)| v.contains(secret)));
+            assert!(!req.body.contains('\n'), "signed body must stay one line: {}", req.body);
+        }
+    }
+
+    #[tokio::test]
+    async fn nul_in_the_iam_user_cannot_truncate_the_signed_field() {
+        // A NUL must not end the form field the way a C string would. The rest
+        // of the name, including an injected UserName, stays inside one value.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let mut cred = mgmt();
+        cred.extra.insert("iam_user".into(), "svc\0root&UserName=admin".into());
+
+        prov.list_keys(&cred).await.unwrap();
+
+        let req = prov.transport.last();
+        assert!(!req.body.contains('\0'), "raw NUL in the body: {}", req.body);
+        assert!(
+            req.body.contains("UserName=svc%00root%26UserName%3Dadmin"),
+            "{}",
+            req.body
+        );
+        assert_eq!(req.body.matches("Action=").count(), 1, "{}", req.body);
+        assert_eq!(req.body.matches("UserName=").count(), 1, "{}", req.body);
+        assert!(req.body.contains("Action=ListAccessKeys"), "{}", req.body);
+        assert!(req.body.contains("Version=2010-05-08"), "{}", req.body);
+        assert!(!req.body.contains("UserName=admin"), "{}", req.body);
+        assert!(!req.body.contains("UserName=svc-backups"), "{}", req.body);
+        assert!(!req.body.contains("EXAMPLEKEY"), "signing secret in the body: {}", req.body);
+        assert!(
+            req.headers.iter().all(|(_, v)| !v.contains('\0') && !v.contains("EXAMPLEKEY")),
+            "NUL or signing secret leaked into a header: {:?}",
+            req.headers
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_signs_the_new_keys_session_token() {
+        // STS temporary credentials fail closed unless the session token is a
+        // signed header on the verify call. That token lives on the new key,
+        // not on the management credential used to mint it.
+        let secret = "verify-only-secret/+=";
+        let token = "FwoGZXIvYXdz/session+token=";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            &caller_identity_xml("arn:aws:iam::123456789012:user/svc-backups"),
+        )]);
+        let prov = Aws::with_transport(fake);
+        let mut cred = Credential::new("AKIANEW", secret);
+        cred.extra.insert("session_token".into(), token.into());
+
+        prov.verify_key(&cred).await.unwrap();
+
+        let req = prov.transport.last();
+        assert_eq!(req.url, STS_ENDPOINT);
+        assert_eq!(req.body, "Action=GetCallerIdentity&Version=2011-06-15");
+        assert!(
+            req.headers.iter().any(|(k, v)| k == "x-amz-security-token" && v == token),
+            "verify must send the new key's session token unchanged: {:?}",
+            req.headers
+        );
+        let auth = req.headers.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        assert!(
+            auth.contains("Credential=AKIANEW/"),
+            "must sign with the new key, not the management key: {auth}"
+        );
+        assert!(
+            auth.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token"),
+            "session token must be covered by the signature: {auth}"
+        );
+        assert!(!req.body.contains(token), "session token must not be a form field: {}", req.body);
+        assert!(!req.body.contains("%2B"), "session token must not be form-encoded: {}", req.body);
+        assert!(!req.body.contains(secret), "new secret leaked into the STS body");
+        assert!(
+            req.headers.iter().all(|(_, v)| !v.contains(secret)),
+            "new secret leaked into a signed header: {:?}",
+            req.headers
+        );
+    }
 }
