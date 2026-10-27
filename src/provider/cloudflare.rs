@@ -577,4 +577,87 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn quoted_account_id_cannot_widen_the_fallback_policy() {
+        // The account id is an object key in the read-only fallback. A quote
+        // or a fake policies array in that id must stay inside the key.
+        let account = "acct-123\"\n],\"policies\":[{\"effect\":\"allow\",\"permission_groups\":[{\"id\":\"admin-breakout\"}]}]";
+        let mgmt_secret = "mgmt-token-value";
+        let token_value = "raw-token-secret";
+        let cred_in = Credential::new(account, mgmt_secret);
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": token_value, "name": "kw" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+
+        let cred = prov.create_key(&cred_in, "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "tok-new");
+        assert_eq!(cred.secret, Cloudflare::<ReqwestTransport>::derive_secret_access_key(token_value));
+        assert_ne!(cred.secret, token_value);
+        assert_eq!(cred.extra.get("account_id").unwrap(), account);
+        assert_eq!(
+            cred.extra.get("s3_endpoint").unwrap(),
+            &format!("https://{account}.r2.cloudflarestorage.com")
+        );
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.url, format!("{API_BASE}/accounts/{account}/tokens"));
+        assert_eq!(req.bearer.as_deref(), Some(mgmt_secret));
+        assert!(!req.url.contains(token_value));
+        assert!(!req.url.contains(mgmt_secret));
+
+        let body = req.body.expect("create body");
+        let policies = body["policies"].as_array().expect("policies array");
+        assert_eq!(policies.len(), 1, "injected policies array must not become a second policy");
+        assert_eq!(policies[0]["effect"], "allow");
+        let groups = policies[0]["permission_groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["id"], R2_READ_PERMISSION_GROUP);
+        assert_ne!(groups[0]["id"], "admin-breakout");
+        let resources = policies[0]["resources"].as_object().unwrap();
+        assert_eq!(resources.len(), 1);
+        assert!(resources.contains_key(&format!("com.cloudflare.api.account.{account}")));
+        let stored: Value = serde_json::from_str(cred.extra.get("policies").unwrap()).unwrap();
+        assert_eq!(stored, body["policies"]);
+
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains(mgmt_secret));
+        assert!(!rendered.contains(token_value));
+        assert!(!rendered.contains(&cred.secret));
+    }
+
+    #[tokio::test]
+    async fn string_error_code_does_not_echo_the_token() {
+        // `errors[].code` is documented as an integer. A string there can carry
+        // the token value; only the integer code and the message may surface.
+        let token_value = "cf-value-SHOULD-NOT-LEAK";
+        let mgmt_secret = "mgmt-SHOULD-NOT-LEAK";
+        let sha = Cloudflare::<ReqwestTransport>::derive_secret_access_key(token_value);
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({
+                "success": false,
+                "errors": [{
+                    "code": format!("{token_value}|{sha}"),
+                    "message": "invalid policy",
+                    "detail": token_value,
+                }],
+                "result": { "id": "tok-new", "value": token_value }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov
+            .create_key(&Credential::new("acct-123", mgmt_secret), "kw", None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("[0]"), "non-integer code must not be interpolated: {msg}");
+        assert!(msg.contains("invalid policy"), "got: {msg}");
+        assert!(!msg.contains(token_value), "token value leaked: {msg}");
+        assert!(!msg.contains(&sha), "derived secret leaked: {msg}");
+        assert!(!msg.contains(mgmt_secret), "management token leaked: {msg}");
+    }
 }
