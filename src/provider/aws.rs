@@ -990,4 +990,102 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn unicode_iam_user_is_utf8_percent_encoded() {
+        // `ä` is UTF-8 C3 A4, not Latin-1 E4. A charset mix-up would sign a
+        // different UserName and could rotate another principal.
+        let secret = "mgmt+secret/EXAMPLE=KEY";
+        let mut cred = Credential::new("AKIAEXAMPLEMGMT", secret);
+        cred.extra.insert("iam_user".into(), "svc-bäckups".into());
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+
+        let keys = prov.list_keys(&cred).await.unwrap();
+        assert!(keys.is_empty());
+
+        let req = prov.transport.last();
+        assert_eq!(req.url, IAM_ENDPOINT);
+        assert_eq!(req.body.matches("Action=").count(), 1);
+        assert!(req.body.contains("Action=ListAccessKeys"));
+        assert_eq!(req.body.matches("UserName=").count(), 1);
+        assert!(
+            req.body.contains("UserName=svc-b%C3%A4ckups"),
+            "UTF-8 percent-encoding missing: {}",
+            req.body
+        );
+        assert!(!req.body.contains("ä"), "raw non-ASCII must not sit in the form body");
+        assert!(!req.body.contains("%E4"), "Latin-1 encoding would target a different user");
+        assert!(!req.body.contains("%c3%a4"), "SigV4 hex must be uppercase");
+        assert!(!req.body.contains(secret), "signing secret leaked into the body");
+        for (name, value) in &req.headers {
+            assert!(!value.contains(secret), "signing secret leaked into header {name}");
+            assert!(!value.contains("ä"), "IAM user leaked into header {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_token_percent_is_signed_raw() {
+        // `%2F` is part of the token, not an encoding of `/`. Decoding or
+        // double-encoding it would make STS reject a live temporary key.
+        let token = "FwoG%2Fraw+token=";
+        let secret = "new-secret";
+        let mut cred = Credential::new("AKIANEW", secret);
+        cred.extra.insert("session_token".into(), token.into());
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            &caller_identity_xml("arn:aws:iam::123456789012:user/svc-backups"),
+        )]);
+        let prov = Aws::with_transport(fake);
+        prov.verify_key(&cred).await.unwrap();
+
+        let req = prov.transport.last();
+        assert_eq!(req.url, STS_ENDPOINT);
+        assert_eq!(req.body, "Action=GetCallerIdentity&Version=2011-06-15");
+        assert!(!req.body.contains(token));
+        assert!(!req.body.contains("%252F"));
+        assert!(!req.body.contains(secret));
+        let sent = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "x-amz-security-token")
+            .map(|(_, v)| v.as_str())
+            .expect("session token header");
+        assert_eq!(sent, token);
+        assert_ne!(sent, "FwoG%252Fraw+token=");
+        assert_ne!(sent, "FwoG/raw+token=");
+        assert_eq!(
+            req.headers.iter().filter(|(k, _)| k == "x-amz-security-token").count(),
+            1
+        );
+
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let auth_of = |session: &str| {
+            let headers = sigv4::sign_query_post(
+                STS_ENDPOINT,
+                "sts",
+                AWS_REGION,
+                "AKIANEW",
+                secret,
+                Some(session),
+                "Action=GetCallerIdentity&Version=2011-06-15",
+                now,
+            )
+            .unwrap();
+            headers.into_iter().find(|(k, _)| k == "authorization").unwrap().1
+        };
+        let auth = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "authorization")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(auth, auth_of(token), "signature must cover the raw token");
+        assert_ne!(auth, auth_of("FwoG/raw+token="), "decoding %2F changes the signature");
+        assert!(!auth.contains(secret));
+        assert!(!auth.contains(token));
+        assert!(auth.contains("x-amz-security-token"));
+    }
 }
