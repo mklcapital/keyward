@@ -990,4 +990,33 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn later_error_message_does_not_replace_or_echo_a_secret() {
+        // The summary is the first <Code> and the first <Message> only. A later
+        // pair must not replace the operator-facing error, and a secret parked
+        // in that later message must not be echoed.
+        let leak = "wJalr-SECOND-MESSAGE-SECRET";
+        let body = format!(
+            "<ErrorResponse><Error>\
+             <Type>Sender</Type>\
+             <Code>AccessDenied</Code>\
+             <Message>not authorized to list keys</Message>\
+             <Code>InternalSecret</Code>\
+             <Message>{leak}</Message>\
+             </Error></ErrorResponse>"
+        );
+        let fake = FakeTransport::new(vec![FakeTransport::ok(403, &body)]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.list_keys(&mgmt()).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HTTP 403 — AccessDenied: not authorized to list keys"),
+            "{msg}"
+        );
+        assert!(!msg.contains(leak), "{msg}");
+        assert!(!msg.contains("InternalSecret"), "{msg}");
+        assert!(!msg.contains("EXAMPLEKEY"), "{msg}");
+        assert_eq!(prov.transport.seen().len(), 1);
+    }
 }

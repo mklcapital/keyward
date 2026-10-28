@@ -312,6 +312,33 @@ mod tests {
     }
 
     #[test]
+    fn passphrase_tamper_fails_closed_without_echoing_plaintext() {
+        let plaintext = b"vault-contents-do-not-leak";
+        let passphrase = "correct horse battery staple";
+        let env = Envelope::seal_with_passphrase("db/meta", passphrase, plaintext).unwrap();
+        assert_eq!(env.scheme, Scheme::AgeScrypt);
+        assert_eq!(env.label, "db/meta");
+        assert!(!env.ciphertext_b64.contains("vault-contents"));
+        assert!(!env.ciphertext_b64.contains("battery staple"));
+        assert_eq!(env.open_with_passphrase(passphrase).unwrap(), plaintext);
+
+        let wrong = env.open_with_passphrase("wrong passphrase").unwrap_err();
+        let wrong_msg = format!("{wrong:#}");
+        assert!(!wrong_msg.contains("vault-contents"), "{wrong_msg}");
+        assert!(!wrong_msg.contains(passphrase), "{wrong_msg}");
+
+        let mut tampered = env.clone();
+        let mut raw = unb64(&tampered.ciphertext_b64).unwrap();
+        let mid = raw.len() / 2;
+        raw[mid] ^= 0xff;
+        tampered.ciphertext_b64 = b64(&raw);
+        let err = tampered.open_with_passphrase(passphrase).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("vault-contents"), "{msg}");
+        assert!(!msg.contains(passphrase), "{msg}");
+    }
+
+    #[test]
     fn recreation_recipe_round_trips_as_json() {
         let kp = KeyPair::generate();
         let recipe = RecreationRecipe {
