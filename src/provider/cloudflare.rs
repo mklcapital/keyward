@@ -577,4 +577,41 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_key_uses_the_requested_name_not_the_old_token_name() {
+        // The replacement token is a new name. Copying the old token's name
+        // would collide with the live token or keep an operator-facing label
+        // that no longer matches the key we just minted. Scope still copies.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": "raw-token-secret", "name": "ignored-response-name" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let old_policies = json!([{
+            "effect": "allow",
+            "permission_groups": [{ "id": "pg-kept" }]
+        }]);
+        let like = KeyInfo {
+            key_id: "tok-old".into(),
+            name: Some("OLD-ADMIN-TOKEN".into()),
+            capabilities: vec![old_policies.to_string()],
+            bucket_id: None,
+        };
+
+        let cred = prov.create_key(&mgmt(), "kw-new", Some(&like)).await.unwrap();
+        assert_eq!(cred.key_id, "tok-new");
+        assert!(!cred.extra.contains_key("name"));
+
+        let req = prov.transport.last();
+        let body = req.body.clone().unwrap();
+        assert_eq!(body["name"], "kw-new");
+        assert_eq!(body["policies"], old_policies);
+        let rendered = body.to_string();
+        assert!(!rendered.contains("OLD-ADMIN-TOKEN"));
+        assert!(!rendered.contains("ignored-response-name"));
+        assert!(!rendered.contains("raw-token-secret"));
+        assert!(!req.url.contains("OLD-ADMIN-TOKEN"));
+        assert!(!req.url.contains("raw-token-secret"));
+    }
 }
