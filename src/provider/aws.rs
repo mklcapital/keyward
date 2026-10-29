@@ -990,4 +990,54 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn signing_ignores_a_region_stashed_in_credential_extras() {
+        // IAM and STS are global and must be signed in us-east-1. A region
+        // stuffed into credential extras (operator config, or a copied field)
+        // must not retarget the signature scope or the region we store.
+        let mut cred = mgmt();
+        cred.extra.insert("region".into(), "eu-west-1".into());
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "once-only-secret")),
+            FakeTransport::ok(200, &caller_identity_xml("arn:aws:iam::123456789012:user/svc-backups")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let mut minted = prov.create_key(&cred, "kw", None).await.unwrap();
+        assert_eq!(minted.extra.get("region").map(String::as_str), Some("us-east-1"));
+        minted.extra.insert("region".into(), "eu-west-1".into());
+        prov.verify_key(&minted).await.unwrap();
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, create, sts verify");
+        for req in &seen {
+            let auth = req.headers.iter().find(|(k, _)| k == "authorization").unwrap().1.as_str();
+            assert!(
+                auth.contains("/us-east-1/"),
+                "signature scope must stay us-east-1: {auth}"
+            );
+            assert!(!auth.contains("eu-west-1"), "extras region leaked into the signature: {auth}");
+            let host = req.headers.iter().find(|(k, _)| k == "host").unwrap().1.as_str();
+            assert!(host == "iam.amazonaws.com" || host == "sts.amazonaws.com", "{host}");
+            assert!(!req.body.contains("eu-west-1"));
+            assert!(!req.body.contains("once-only-secret"));
+            assert!(!req.body.contains(&cred.secret));
+            for (_name, value) in &req.headers {
+                assert!(!value.contains("once-only-secret"));
+                assert!(!value.contains(&cred.secret));
+                assert!(!value.contains("eu-west-1"));
+            }
+        }
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=CreateAccessKey"));
+        assert!(seen[1].body.contains("UserName=svc-backups"));
+        let create_auth = seen[1].headers.iter().find(|(k, _)| k == "authorization").unwrap().1.as_str();
+        assert!(create_auth.contains("/us-east-1/iam/aws4_request"), "{create_auth}");
+        assert_eq!(seen[2].url, STS_ENDPOINT);
+        assert!(seen[2].body.contains("Action=GetCallerIdentity"));
+        let verify_auth = seen[2].headers.iter().find(|(k, _)| k == "authorization").unwrap().1.as_str();
+        assert!(verify_auth.contains("/us-east-1/sts/aws4_request"), "{verify_auth}");
+        assert!(!verify_auth.contains("/iam/"), "{verify_auth}");
+    }
 }
