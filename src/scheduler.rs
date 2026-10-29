@@ -428,4 +428,75 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn format_plan_buckets_overdue_minutes_hours_and_days() {
+        let now = DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let plan = vec![
+            PlanEntry {
+                target: "overdue".into(),
+                next_run: now - chrono::Duration::minutes(2),
+                freshly_scheduled: false,
+            },
+            PlanEntry {
+                target: "soon".into(),
+                next_run: now + chrono::Duration::minutes(59),
+                freshly_scheduled: true,
+            },
+            PlanEntry {
+                target: "hour".into(),
+                next_run: now + chrono::Duration::minutes(90),
+                freshly_scheduled: false,
+            },
+            PlanEntry {
+                target: "day".into(),
+                next_run: now + chrono::Duration::hours(27),
+                freshly_scheduled: true,
+            },
+        ];
+        let text = format_plan(&plan, now);
+        assert!(text.contains("overdue") && text.contains("due now") && text.contains("[persisted]"), "{text}");
+        assert!(!text.contains("in -"), "a negative delay must not be printed: {text}");
+        assert!(text.contains("soon") && text.contains("in 59m") && text.contains("[new]"), "{text}");
+        assert!(text.contains("hour") && text.contains("in 1h30m") && text.contains("[persisted]"), "{text}");
+        assert!(!text.contains("in 90m"), "{text}");
+        assert!(text.contains("day") && text.contains("in 1d3h") && text.contains("[new]"), "{text}");
+        assert!(!text.contains("in 27h"), "{text}");
+        assert_eq!(format_plan(&[], now), "(no targets have a [schedule] block)");
+    }
+
+    #[test]
+    fn next_run_keeps_a_subsecond_interval() {
+        // The delay is converted through milliseconds. Truncating to whole
+        // seconds would schedule a 1500ms interval a half-second early.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let base = DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let next = next_run_from(base, &sched("1500ms", "0s"), &mut rng);
+        assert_eq!((next - base).num_milliseconds(), 1500);
+        assert!(next > base);
+    }
+
+    #[test]
+    fn plan_keeps_config_order_when_deadlines_tie() {
+        // `--once` prints plan() order. Equal deadlines stay in config order.
+        // (The run loop picks the lexicographically earlier name instead.)
+        let cfg = cfg_with(vec![
+            ("zeta", Some(sched("7d", "0s"))),
+            ("alpha", Some(sched("7d", "0s"))),
+        ]);
+        let mut state = State::default();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let now = DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let plan = plan(&cfg, &mut state, now, &mut rng);
+        let names: Vec<_> = plan.iter().map(|p| p.target.as_str()).collect();
+        assert_eq!(names, vec!["zeta", "alpha"]);
+        assert_eq!(plan[0].next_run, plan[1].next_run);
+        assert!(plan.iter().all(|entry| entry.freshly_scheduled));
+    }
 }
