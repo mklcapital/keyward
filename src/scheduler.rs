@@ -428,4 +428,51 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn format_plan_switches_buckets_on_the_exact_boundaries() {
+        // The buckets are `< 0`, `< 60`, `< 1440`. The minute on each side of
+        // those cuts is what a `<=` edit would print differently.
+        let now = DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let entry = |name: &str, delta: chrono::Duration| PlanEntry {
+            target: name.into(),
+            next_run: now + delta,
+            freshly_scheduled: false,
+        };
+        let plan = vec![
+            entry("zero", chrono::Duration::minutes(0)),
+            entry("hour", chrono::Duration::minutes(60)),
+            entry("lasthour", chrono::Duration::minutes(1439)),
+            entry("day", chrono::Duration::hours(24)),
+        ];
+        let text = format_plan(&plan, now);
+        assert!(text.contains("zero") && text.contains("in 0m"), "{text}");
+        assert!(!text.contains("due now"), "{text}");
+        assert!(text.contains("in 1h0m"), "{text}");
+        assert!(!text.contains("in 60m"), "{text}");
+        assert!(text.contains("in 23h59m"), "{text}");
+        assert!(!text.contains("in 1439m"), "{text}");
+        assert!(text.contains("in 1d0h"), "{text}");
+        assert!(!text.contains("in 24h"), "{text}");
+    }
+
+    #[test]
+    fn next_run_truncates_fractional_milliseconds_toward_zero() {
+        // `(delay * 1000.0) as i64` truncates. Rounding up would schedule a
+        // sub-millisecond interval a millisecond late, and a 0.999ms interval
+        // a full millisecond late instead of on the base instant.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let base = DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut delay_ms = |interval: std::time::Duration| {
+            let sched = Schedule { interval, jitter: std::time::Duration::ZERO };
+            (next_run_from(base, &sched, &mut rng) - base).num_milliseconds()
+        };
+        assert_eq!(delay_ms(std::time::Duration::from_micros(999)), 0);
+        assert_eq!(delay_ms(std::time::Duration::from_micros(1000)), 1);
+        assert_eq!(delay_ms(std::time::Duration::from_micros(1999)), 1);
+    }
 }

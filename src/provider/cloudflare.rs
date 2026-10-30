@@ -577,4 +577,45 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_key_accepts_http_399_and_rejects_http_400() {
+        // Cloudflare's error line is 400, not 300. A 399 with success:true
+        // still mints. A 400 with success:true must not, and must not echo
+        // the token value sitting in `result`.
+        let minted = "cf-value-minted-once";
+        let rejected = "cf-value-must-not-echo";
+        let rejected_digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key(rejected);
+
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            399,
+            envelope(json!({ "id": "tok-399", "value": minted })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "tok-399");
+        assert_eq!(
+            cred.secret,
+            Cloudflare::<ReqwestTransport>::derive_secret_access_key(minted)
+        );
+        assert_ne!(cred.secret, minted);
+
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            400,
+            json!({
+                "success": true,
+                "errors": [{ "code": 1000, "message": "bad request" }],
+                "result": { "id": "tok-400", "value": rejected }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 400"), "{msg}");
+        assert!(!msg.contains(rejected), "{msg}");
+        assert!(!msg.contains(&rejected_digest), "{msg}");
+        assert!(!msg.contains("tok-400"), "{msg}");
+        assert!(!msg.contains("mgmt-token-value"), "{msg}");
+        assert_eq!(prov.transport.last().method, "POST");
+    }
 }
