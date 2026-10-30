@@ -328,4 +328,23 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn a_public_recipient_is_not_an_identity() {
+        // `age1...` encrypts only. Parsing it as an identity must fail, so a
+        // swapped key file cannot decrypt what it was used to seal.
+        let kp = KeyPair::generate();
+        let recipient = kp.recipient_str();
+        assert!(recipient.starts_with("age1"), "{recipient}");
+        let err = match KeyPair::from_identity_str(&recipient) {
+            Err(err) => err,
+            Ok(_) => panic!("a public recipient must not parse as an identity"),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid age identity"), "{msg}");
+        assert!(!msg.contains("AGE-SECRET-KEY-1"), "{msg}");
+
+        assert!(KeyPair::from_identity_str("").is_err());
+        assert!(KeyPair::from_identity_str("AGE-SECRET-KEY-1").is_err());
+    }
 }

@@ -990,4 +990,36 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn make_room_deletes_an_undated_inactive_key_and_keeps_the_dated_one() {
+        // A missing CreateDate sorts as the empty string, which is older than
+        // any real timestamp. The dated inactive key is the rollback anchor
+        // and must survive even though it is listed first.
+        let xml = "\
+<ListAccessKeysResponse><ListAccessKeysResult><AccessKeyMetadata>\
+<member><AccessKeyId>AKIADATED</AccessKeyId><Status>Inactive</Status>\
+<CreateDate>2020-01-01T00:00:00Z</CreateDate></member>\
+<member><AccessKeyId>AKIAUNDATED</AccessKeyId><Status>Inactive</Status></member>\
+</AccessKeyMetadata></ListAccessKeysResult></ListAccessKeysResponse>";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, xml),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, "brand-new-secret");
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, one delete, create");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIAUNDATED"), "got: {}", seen[1].body);
+        assert!(
+            !seen.iter().any(|r| r.body.contains("AKIADATED") || r.body.contains("brand-new-secret")),
+            "dated inactive key or new secret leaked into a request: {:?}",
+            seen.iter().map(|r| r.body.clone()).collect::<Vec<_>>()
+        );
+    }
 }
