@@ -328,4 +328,31 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn envelope_json_keeps_stable_scheme_tags() {
+        // Stored recipes outlive the code. The on-disk tag is kebab-case;
+        // renaming the enum or dropping rename_all would fail to open them.
+        assert_eq!(serde_json::to_value(Scheme::AgeX25519).unwrap(), "age-x25519");
+        assert_eq!(serde_json::to_value(Scheme::AgeScrypt).unwrap(), "age-scrypt");
+
+        let kp = KeyPair::generate();
+        let env = Envelope::seal("db/meta", &kp, b"recipe-body").unwrap();
+        let stored = serde_json::to_value(&env).unwrap();
+        assert_eq!(stored["scheme"], "age-x25519");
+        assert_eq!(stored["label"], "db/meta");
+        assert!(!stored["ciphertext_b64"].as_str().unwrap().contains("recipe-body"));
+        let back: Envelope = serde_json::from_value(stored).unwrap();
+        assert_eq!(back.open(&kp).unwrap(), b"recipe-body");
+
+        let unknown = serde_json::json!({
+            "scheme": "age-rot13",
+            "label": "db/meta",
+            "ciphertext_b64": "YQ==",
+        });
+        assert!(
+            serde_json::from_value::<Envelope>(unknown).is_err(),
+            "an unknown scheme must not deserialize into a decryptable envelope"
+        );
+    }
 }

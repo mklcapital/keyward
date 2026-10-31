@@ -428,4 +428,38 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn default_state_path_uses_xdg_state_home() {
+        // KEYWARD_STATE wins when it is set. When it is not, the schedule file
+        // is <XDG_STATE_HOME>/keyward/schedule.json — not a path joined onto
+        // the env var, and not the process working directory.
+        struct Restore {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let xdg = dir.path().join("xdg-state");
+        let _state = Restore {
+            key: "KEYWARD_STATE",
+            previous: std::env::var_os("KEYWARD_STATE"),
+        };
+        let _xdg = Restore {
+            key: "XDG_STATE_HOME",
+            previous: std::env::var_os("XDG_STATE_HOME"),
+        };
+        std::env::remove_var("KEYWARD_STATE");
+        std::env::set_var("XDG_STATE_HOME", &xdg);
+
+        assert_eq!(default_state_path(), xdg.join("keyward").join("schedule.json"));
+    }
 }
