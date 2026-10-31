@@ -990,4 +990,51 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[test]
+    fn http_and_https_of_the_same_host_sign_identically() {
+        // SigV4 canonical requests carry the host, not the scheme or the URL
+        // path. An http endpoint and an https endpoint with a junk path must
+        // produce the same signature, and neither header set may contain the
+        // signing secret or the scheme.
+        use chrono::TimeZone;
+        let date = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let secret = "signing-secret-not-in-headers";
+        let body = "Action=ListAccessKeys&Version=2010-05-08";
+        let sign = |endpoint: &str| {
+            sigv4::sign_query_post(
+                endpoint,
+                "iam",
+                "us-east-1",
+                "AKIDEXAMPLE",
+                secret,
+                None,
+                body,
+                date,
+            )
+            .unwrap()
+        };
+        let https = sign("https://iam.amazonaws.com/");
+        let http = sign("http://iam.amazonaws.com/ignored?Action=DeleteUser");
+
+        let host = |headers: &[(String, String)]| {
+            headers.iter().find(|(k, _)| k == "host").map(|(_, v)| v.clone()).unwrap()
+        };
+        let auth = |headers: &[(String, String)]| {
+            headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone()).unwrap()
+        };
+        assert_eq!(host(&https), "iam.amazonaws.com");
+        assert_eq!(host(&http), host(&https));
+        assert_eq!(auth(&http), auth(&https), "scheme and path must not change the signature");
+        assert!(auth(&https).contains("SignedHeaders=content-type;host;x-amz-date"));
+        assert!(!auth(&https).contains("x-amz-security-token"));
+        for headers in [&https, &http] {
+            for (name, value) in headers {
+                assert!(!value.contains(secret), "{name} echoed the signing secret");
+                assert!(!value.contains("http://") && !value.contains("https://"), "{name}={value}");
+                assert!(!value.contains("DeleteUser"), "{name} included the URL query");
+                assert!(!value.contains("ignored"), "{name} included the URL path");
+            }
+        }
+    }
 }

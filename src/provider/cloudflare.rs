@@ -577,4 +577,37 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn fallback_policy_is_account_scoped_bucket_read() {
+        // No discovered policy must not become account-admin. The resource map
+        // is the scope; the permission-group id is the documented R2 read group,
+        // not whatever the constant currently points at.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": "raw-token-value", "name": "ignored" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-fallback", None).await.unwrap();
+
+        let sent = prov.transport.last().body.unwrap();
+        assert_eq!(sent["name"], "kw-fallback");
+        assert_eq!(
+            sent["policies"],
+            json!([{
+                "effect": "allow",
+                "resources": {
+                    "com.cloudflare.api.account.acct-123": {
+                        "com.cloudflare.edge.r2.bucket.*": "*"
+                    }
+                },
+                "permission_groups": [{ "id": "6a018a9f2fc74eb6b293b0c548f38b39" }]
+            }])
+        );
+        let body = sent.to_string();
+        assert!(!body.contains("raw-token-value"), "minted token must not be echoed in the request");
+        assert!(!body.contains("mgmt-token-value"), "management token is a header, not a policy field");
+        assert!(!body.contains(&cred.secret), "derived secret must not be sent back");
+        assert_eq!(sent["policies"].as_array().map(Vec::len), Some(1));
+    }
 }
