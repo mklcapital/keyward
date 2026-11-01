@@ -990,4 +990,33 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn list_keys_percent_encodes_question_and_hash_in_the_user_name() {
+        // `?` and `#` are not form separators, but they must not survive as raw
+        // bytes that a later parser could treat as a query or fragment.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let mut cred = mgmt();
+        cred.extra.insert("iam_user".into(), "svc?#UserName=root".into());
+        let keys = prov.list_keys(&cred).await.unwrap();
+        assert!(keys.is_empty());
+
+        let req = prov.transport.last();
+        assert_eq!(req.body.matches("Action=").count(), 1, "got: {}", req.body);
+        assert_eq!(req.body.matches("UserName=").count(), 1, "got: {}", req.body);
+        assert!(req.body.contains("Action=ListAccessKeys"), "got: {}", req.body);
+        assert!(req.body.contains("Version=2010-05-08"), "got: {}", req.body);
+        assert!(
+            req.body.contains("UserName=svc%3F%23UserName%3Droot"),
+            "got: {}",
+            req.body
+        );
+        assert!(!req.body.contains("UserName=root"), "got: {}", req.body);
+        assert!(!req.body.contains('?'), "got: {}", req.body);
+        assert!(!req.body.contains('#'), "got: {}", req.body);
+        let secret = "wJalrXUtnFEMI/EXAMPLEKEY";
+        assert!(!req.body.contains(secret));
+        assert!(!req.headers.iter().any(|(_, v)| v.contains(secret)));
+    }
 }

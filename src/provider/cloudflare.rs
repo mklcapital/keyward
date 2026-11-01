@@ -577,4 +577,53 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn listed_numeric_ids_are_not_coerced_and_boolean_policies_fall_back() {
+        // A numeric token id must not become the decimal string "4242" (that
+        // would select or revoke a different token). A JSON boolean policy is
+        // not a policy array and must fall back to read-only.
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                envelope(json!([
+                    { "id": "tok-real", "name": "alpha", "policies": [{ "effect": "allow" }] },
+                    { "id": 4242, "name": 7, "policies": false },
+                ])),
+            ),
+            FakeTransport::ok(
+                200,
+                envelope(json!({ "id": "tok-new", "value": "raw-token-secret", "name": "ignored" })),
+            ),
+        ]);
+        let prov = Cloudflare::with_transport(fake);
+        let keys = prov.list_keys(&mgmt()).await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key_id, "tok-real");
+        assert_eq!(keys[0].name.as_deref(), Some("alpha"));
+        assert_eq!(keys[1].key_id, "");
+        assert_ne!(keys[1].key_id, "4242");
+        assert_eq!(keys[1].name, None);
+        assert_eq!(keys[1].capabilities, vec!["false".to_string()]);
+
+        let cred = prov.create_key(&mgmt(), "kw-new", Some(&keys[1])).await.unwrap();
+        assert_eq!(cred.key_id, "tok-new");
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let sent = req.body.unwrap();
+        assert_eq!(sent["name"], "kw-new");
+        assert_ne!(sent["name"], "7");
+        let policies = &sent["policies"];
+        assert_eq!(policies.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(
+            policies[0]["permission_groups"][0]["id"],
+            "6a018a9f2fc74eb6b293b0c548f38b39"
+        );
+        let rendered = sent.to_string();
+        assert!(!rendered.contains("false"), "boolean policy must not be forwarded: {rendered}");
+        assert!(!rendered.contains("4242"), "numeric id must not be forwarded: {rendered}");
+        assert!(!rendered.contains("raw-token-secret"), "got: {rendered}");
+        assert!(!rendered.contains("mgmt-token-value"), "got: {rendered}");
+    }
 }
