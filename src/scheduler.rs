@@ -428,4 +428,98 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn format_plan_drops_sub_hour_remainder_past_one_day() {
+        // Once the horizon is at least a day, leftover minutes are not shown.
+        // 24h59m must stay `in 1d0h`, and 1d1h59m must stay `in 1d1h`.
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let entry = |mins: i64| PlanEntry {
+            target: "alpha".into(),
+            next_run: now + chrono::Duration::minutes(mins),
+            freshly_scheduled: false,
+        };
+        let day = format_plan(&[entry(24 * 60 + 59)], now);
+        assert!(day.contains("in 1d0h)"), "got: {day}");
+        assert!(!day.contains("59m"), "minutes must not reappear past a day: {day}");
+        assert!(!day.contains("in 24h"), "got: {day}");
+        assert!(!day.contains("due now"), "got: {day}");
+        let day_hour = format_plan(&[entry(24 * 60 + 60 + 59)], now);
+        assert!(day_hour.contains("in 1d1h)"), "got: {day_hour}");
+        assert!(!day_hour.contains("59m"), "got: {day_hour}");
+        assert!(day_hour.contains("[persisted]"), "got: {day_hour}");
+    }
+
+    #[test]
+    fn plan_keeps_an_overdue_persisted_next_run() {
+        // Planning must not clamp a missed run up to `now`. Doing so would
+        // postpone the rotation by a full interval without firing it.
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let overdue = now - chrono::Duration::days(10);
+        let cfg = cfg_with(vec![
+            ("later", Some(sched("30d", "0s"))),
+            ("missed", Some(sched("7d", "0s"))),
+        ]);
+        let mut state = State::default();
+        state.next_run.insert("missed".into(), overdue);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let plan = plan(&cfg, &mut state, now, &mut rng);
+        assert_eq!(plan[0].target, "missed");
+        assert_eq!(plan[0].next_run, overdue);
+        assert!(!plan[0].freshly_scheduled);
+        assert_eq!(state.next_run["missed"], overdue);
+        assert_eq!(plan[1].target, "later");
+        assert!(plan[1].freshly_scheduled);
+        assert_eq!(plan[1].next_run, now + chrono::Duration::days(30));
+    }
+
+    #[test]
+    fn load_rejects_a_non_object_state_file() {
+        // A missing file is an empty plan. A truncated or wrong-shaped file
+        // must fail closed so the scheduler does not re-roll every target.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = ["[]", "null", "{\"last_run\":{}}", "{\"next_run\":null}"];
+        for (i, body) in bad.iter().enumerate() {
+            let path = dir.path().join(format!("bad-{i}.json"));
+            std::fs::write(&path, body).unwrap();
+            let err = State::load(&path).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("parsing state"), "{body} => {msg}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), *body);
+        }
+        let path = dir.path().join("empty-map.json");
+        std::fs::write(&path, "{\"next_run\":{}}").unwrap();
+        let loaded = State::load(&path).unwrap();
+        assert!(loaded.next_run.is_empty());
+        assert!(loaded.last_run.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_loop_zero_iters_does_not_fire_a_due_target() {
+        // `max_iters == 0` is the off-by-one boundary: the due target is
+        // loaded and saved, but the hook must not run and last_run stays empty.
+        use chrono::TimeZone;
+        let cfg = cfg_with(vec![("t", Some(sched("30d", "0s")))]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let due = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut state = State::default();
+        state.next_run.insert("t".into(), due);
+        state.save(&path).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = CountingHook { count: count.clone(), fired: fired.clone() };
+
+        let n = run(&cfg, &path, &hook, Some(0)).await.unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(fired.lock().unwrap().is_empty());
+
+        let after = State::load(&path).unwrap();
+        assert!(after.last_run.is_empty(), "a zero-iter loop must not record a run");
+        assert_eq!(after.next_run.get("t"), Some(&due));
+    }
 }
