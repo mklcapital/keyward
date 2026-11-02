@@ -416,6 +416,61 @@ mod tests {
         assert!(after.next_run["t"] > Utc::now() + chrono::Duration::days(29));
     }
 
+    #[test]
+    fn zero_interval_stays_on_the_base_instant() {
+        // `interval = "0s"` must not be rewritten into a default period, and a
+        // negative jitter draw must not schedule before `base` (the loop would
+        // treat that slot as already due and spin).
+        use chrono::TimeZone;
+        let base = Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        assert_eq!(next_run_from(base, &sched("0s", "0s"), &mut rng), base);
+
+        let mut low = rand::rngs::mock::StepRng::new(0, 0);
+        assert_eq!(next_run_from(base, &sched("0s", "1h"), &mut low), base);
+    }
+
+    #[test]
+    fn relative_state_dir_does_not_move_the_schedule() {
+        // An absolute XDG_STATE_HOME is honored. A relative or empty one is not,
+        // and must not land the schedule in the working directory or in
+        // XDG_DATA_HOME — that would re-roll jitter from a different file.
+        struct Restore {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let data = dir.path().join("xdg-data");
+        let expected = home.join(".local").join("state").join("keyward").join("schedule.json");
+        let _guards = [
+            Restore { key: "KEYWARD_STATE", previous: std::env::var_os("KEYWARD_STATE") },
+            Restore { key: "XDG_STATE_HOME", previous: std::env::var_os("XDG_STATE_HOME") },
+            Restore { key: "XDG_DATA_HOME", previous: std::env::var_os("XDG_DATA_HOME") },
+            Restore { key: "HOME", previous: std::env::var_os("HOME") },
+        ];
+        std::env::remove_var("KEYWARD_STATE");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", &data);
+
+        for relative in ["not-absolute", ""] {
+            std::env::set_var("XDG_STATE_HOME", relative);
+            let got = default_state_path();
+            assert_eq!(got, expected, "XDG_STATE_HOME={relative:?}");
+            assert!(!got.starts_with(&data), "{got:?}");
+            assert!(!got.ends_with("not-absolute/keyward/schedule.json"), "{got:?}");
+        }
+    }
+
     #[tokio::test]
     async fn run_loop_no_scheduled_targets_is_noop() {
         let cfg = cfg_with(vec![("t", None)]);

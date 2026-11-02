@@ -545,6 +545,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sparse_policy_array_is_preserved_not_replaced_by_read_only() {
+        // A non-empty policy array is the old token's scope, even when the only
+        // element is an empty object. It must be copied verbatim. Falling back
+        // here would swap in the account-wide read-only group instead.
+        let raw = "raw-token-not-in-body";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": raw, "name": "kw" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let like = KeyInfo {
+            key_id: "tok-old".into(),
+            capabilities: vec!["[{}]".into()],
+            ..KeyInfo::default()
+        };
+        let cred = prov.create_key(&mgmt(), "kw", Some(&like)).await.unwrap();
+        assert_eq!(cred.key_id, "tok-new");
+        assert_ne!(cred.secret, raw);
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert!(req.url.ends_with("/accounts/acct-123/tokens"), "{}", req.url);
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.unwrap();
+        assert_eq!(body["policies"], json!([{}]));
+        let rendered = body.to_string();
+        assert!(!rendered.contains(R2_READ_PERMISSION_GROUP), "{rendered}");
+        assert!(!rendered.contains("acct-123"), "{rendered}");
+        assert!(!rendered.contains("mgmt-token-value"), "{rendered}");
+        assert!(!rendered.contains(raw), "{rendered}");
+        assert!(!req.url.contains("mgmt-token-value"), "{}", req.url);
+        assert!(!req.url.contains(raw), "{}", req.url);
+    }
+
+    #[tokio::test]
     async fn api_error_envelope_is_surfaced() {
         // Cloudflare returns 200 with success:false for logical errors.
         let fake = FakeTransport::new(vec![FakeTransport::ok(
