@@ -990,4 +990,73 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn create_key_ignores_a_name_that_looks_like_extra_form_fields() {
+        // IAM access keys have no name. The name argument must not be copied
+        // into the signed body, where `&` / `=` would add a second UserName
+        // or Action and retarget the call.
+        let injected = "root&UserName=admin&Action=DeleteUser";
+        let secret = "s3cr3t-once-only";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), injected, None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list then create; the name must not add a call");
+        for req in &seen {
+            assert_eq!(req.body.matches("UserName=").count(), 1, "body: {}", req.body);
+            assert_eq!(req.body.matches("Action=").count(), 1, "body: {}", req.body);
+            assert!(req.body.contains("UserName=svc-backups"), "body: {}", req.body);
+            assert!(!req.body.contains("DeleteUser"), "body: {}", req.body);
+            assert!(!req.body.contains("UserName=admin"), "body: {}", req.body);
+            assert!(!req.body.contains("UserName=root"), "body: {}", req.body);
+            assert!(!req.body.contains(injected), "body: {}", req.body);
+            assert!(!req.body.contains(secret), "body: {}", req.body);
+            assert!(!req.body.contains("wJalrXUtnFEMI/EXAMPLEKEY"), "body: {}", req.body);
+            assert!(!req.headers.iter().any(|(_, v)| v.contains(secret) || v.contains(injected)));
+        }
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=CreateAccessKey"));
+        assert!(!seen.iter().any(|r| r.body.contains("Action=DeleteAccessKey")));
+    }
+
+    #[tokio::test]
+    async fn make_room_string_sorts_a_date_only_ahead_of_the_same_day_timestamp() {
+        // CreateDate is compared as text, not parsed. A date-only value is a
+        // prefix of that day's timestamp, so it sorts first and is the victim
+        // even when the full timestamp is listed first.
+        let secret = "brand-new-secret-ONCE";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIASTAMP", "Inactive", "2020-01-02T00:00:00Z"),
+                    ("AKIADATEONLY", "Inactive", "2020-01-02"),
+                ]),
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete the date-only key, create");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"), "body: {}", seen[1].body);
+        assert!(seen[1].body.contains("AccessKeyId=AKIADATEONLY"), "body: {}", seen[1].body);
+        assert!(!seen[1].body.contains("AKIASTAMP"), "must keep the timestamped key: {}", seen[1].body);
+        assert_eq!(seen[1].body.matches("AccessKeyId=").count(), 1, "body: {}", seen[1].body);
+        for req in &seen {
+            assert!(!req.body.contains(secret), "body: {}", req.body);
+            assert!(!req.headers.iter().any(|(_, v)| v.contains(secret)));
+        }
+    }
 }
