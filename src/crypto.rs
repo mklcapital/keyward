@@ -328,4 +328,42 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn label_is_cleartext_and_swapping_it_still_decrypts() {
+        // The label is operator metadata outside the age payload. It is not
+        // authenticated: changing it must not mint a different plaintext, and
+        // it must not be required to open the ciphertext.
+        let kp = KeyPair::generate();
+        let secret = b"PLAINTEXT-SENTINEL-do-not-leak";
+        let env = Envelope::seal("LABEL-SENTINEL-ops/recipe-7f3a", &kp, secret).unwrap();
+        let dumped = serde_json::to_string(&env).unwrap();
+        assert!(dumped.contains("LABEL-SENTINEL-ops/recipe-7f3a"));
+        assert!(!env.ciphertext_b64.contains("LABEL-SENTINEL"));
+        assert!(!env.ciphertext_b64.contains("PLAINTEXT-SENTINEL"));
+        let mut swapped = env.clone();
+        swapped.label = "attacker/other-target".into();
+        assert_eq!(swapped.ciphertext_b64, env.ciphertext_b64);
+        assert_eq!(swapped.open(&kp).unwrap(), secret);
+        assert_ne!(swapped.open(&kp).unwrap(), b"attacker/other-target");
+
+        let penv = Envelope::seal_with_passphrase(
+            "LABEL-SENTINEL-db/meta",
+            "correct horse battery staple",
+            secret,
+        )
+        .unwrap();
+        assert_eq!(penv.scheme, Scheme::AgeScrypt);
+        let pdumped = serde_json::to_string(&penv).unwrap();
+        assert!(pdumped.contains("LABEL-SENTINEL-db/meta"));
+        assert!(!penv.ciphertext_b64.contains("LABEL-SENTINEL"));
+        assert!(!penv.ciphertext_b64.contains("PLAINTEXT-SENTINEL"));
+        let mut pswap = penv.clone();
+        pswap.label = "attacker/other-target".into();
+        assert_eq!(pswap.ciphertext_b64, penv.ciphertext_b64);
+        assert_eq!(
+            pswap.open_with_passphrase("correct horse battery staple").unwrap(),
+            secret
+        );
+    }
 }

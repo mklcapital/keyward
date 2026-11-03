@@ -577,4 +577,33 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn two_api_errors_are_joined_and_extra_fields_are_not_echoed() {
+        let planted = "raw-token-SHOULD-NOT-LEAK";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({
+                "success": false,
+                "errors": [
+                    {
+                        "code": 1000,
+                        "message": "first problem",
+                        "value": planted,
+                        "detail": { "token": planted }
+                    },
+                    { "code": 1001, "message": "second problem", "value": planted }
+                ],
+                "result": { "id": "tok-new", "value": planted }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[1000] first problem; [1001] second problem"), "got: {msg}");
+        assert!(!msg.contains(planted), "got: {msg}");
+        assert!(!msg.contains("mgmt-token-value"), "got: {msg}");
+        assert!(!msg.contains("tok-new"), "got: {msg}");
+        assert_eq!(prov.transport.last().method, "POST");
+    }
 }
