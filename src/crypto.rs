@@ -328,4 +328,32 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn empty_plaintext_round_trips_and_wrapped_base64_fails_closed() {
+        let kp = KeyPair::generate();
+        let env = Envelope::seal("db/meta", &kp, b"").unwrap();
+        assert_eq!(env.scheme, Scheme::AgeX25519);
+        assert!(!env.ciphertext_b64.is_empty());
+        assert!(!env.ciphertext_b64.contains("db/meta"));
+        assert_eq!(env.open(&kp).unwrap(), b"");
+        assert!(env.open(&KeyPair::generate()).is_err());
+
+        let mut wrapped = env.ciphertext_b64.clone();
+        let mid = wrapped.len() / 2;
+        wrapped.insert(mid, '\n');
+        let mut broken = env.clone();
+        broken.ciphertext_b64 = wrapped;
+        let err = broken.open(&kp).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("base64"), "{msg}");
+        assert!(!msg.contains(&kp.identity_str()), "{msg}");
+
+        let identity = kp.identity_str();
+        let rejected = match KeyPair::from_identity_str(&format!("\n{identity}")) {
+            Err(err) => format!("{err:#}"),
+            Ok(_) => panic!("a leading newline must not parse as an identity"),
+        };
+        assert!(!rejected.contains(&identity), "{rejected}");
+    }
 }
