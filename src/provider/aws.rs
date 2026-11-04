@@ -990,4 +990,85 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn empty_session_token_is_signed_and_version_stays_last() {
+        // An empty session token is still present. Dropping it would sign a
+        // different request than the one AWS verifies against the header.
+        let mut cred = mgmt();
+        cred.extra.insert("session_token".into(), "".into());
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let keys = prov.list_keys(&cred).await.unwrap();
+        assert!(keys.is_empty());
+
+        let req = prov.transport.last();
+        assert_eq!(
+            req.body,
+            "Action=ListAccessKeys&UserName=svc-backups&Version=2010-05-08"
+        );
+        assert!(!req.body.contains("wJalrXUtnFEMI/EXAMPLEKEY"), "body: {}", req.body);
+        assert!(!req.body.contains("session"), "body: {}", req.body);
+        let token_hdr = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "x-amz-security-token")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(token_hdr, Some(""));
+        let auth = req.headers.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        assert!(auth.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token"), "{auth}");
+        assert!(!auth.contains("wJalrXUtnFEMI/EXAMPLEKEY"), "{auth}");
+
+        use chrono::TimeZone;
+        let without = sigv4::sign_query_post(
+            IAM_ENDPOINT,
+            "iam",
+            AWS_REGION,
+            &cred.key_id,
+            &cred.secret,
+            None,
+            &req.body,
+            chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let auth_without = without.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        assert_ne!(auth, auth_without, "an empty session token must change the signature");
+        assert!(!auth_without.contains("x-amz-security-token"), "{auth_without}");
+    }
+
+    #[tokio::test]
+    async fn make_room_string_sorts_an_offset_create_date_ahead_of_zulu() {
+        // CreateDate is compared as text. `+` sorts before `Z`, so the offset
+        // form of the same instant is the victim and the Active key is not.
+        let secret = "offset-secret-only-once/=";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIAACTIVE", "Active", "2020-01-02T00:00:00Z"),
+                    ("AKIAZULU", "Inactive", "2020-01-02T00:00:00Z"),
+                    ("AKIAOFFSET", "Inactive", "2020-01-02T00:00:00+00:00"),
+                ]),
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.secret, secret);
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete the offset key, create");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"), "{}", seen[1].body);
+        assert!(seen[1].body.contains("AccessKeyId=AKIAOFFSET"), "{}", seen[1].body);
+        assert!(!seen[1].body.contains("AKIAZULU"), "{}", seen[1].body);
+        assert!(!seen[1].body.contains("AKIAACTIVE"), "{}", seen[1].body);
+        for req in &seen {
+            assert!(!req.body.contains(secret), "body: {}", req.body);
+            assert!(
+                !req.headers.iter().any(|(_, v)| v.contains(secret)),
+                "headers leaked the secret"
+            );
+        }
+    }
 }

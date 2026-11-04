@@ -428,4 +428,49 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn format_plan_truncates_partial_minutes_toward_zero() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let line = |secs: i64| {
+            format_plan(
+                &[PlanEntry {
+                    target: "alpha".into(),
+                    next_run: now + chrono::Duration::seconds(secs),
+                    freshly_scheduled: false,
+                }],
+                now,
+            )
+        };
+        let almost = line(59);
+        assert!(almost.contains("alpha"), "{almost}");
+        assert!(almost.contains("in 0m"), "{almost}");
+        assert!(!almost.contains("due now"), "{almost}");
+        assert!(!almost.contains("in 1m"), "{almost}");
+        let minute = line(60);
+        assert!(minute.contains("in 1m"), "{minute}");
+        assert!(!minute.contains("in 0m"), "{minute}");
+        assert!(!minute.contains("due now"), "{minute}");
+    }
+
+    #[test]
+    fn offset_next_run_loads_as_utc_and_a_zoneless_stamp_stays_on_disk() {
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        std::fs::write(&path, r#"{"next_run":{"alpha":"2026-07-07T13:00:00+01:00"}}"#).unwrap();
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(
+            loaded.next_run["alpha"],
+            Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap()
+        );
+
+        let raw = r#"{"next_run":{"alpha":"2026-07-07T12:00:00"}}"#;
+        std::fs::write(&path, raw).unwrap();
+        let err = State::load(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parsing state"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+    }
 }
