@@ -428,4 +428,50 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn jitter_wider_than_the_interval_clamps_low_and_does_not_cap_high() {
+        // StepRng(0) is the lower endpoint. When jitter is wider than the
+        // interval that draw would be before `base` if the delay were not
+        // clamped. The maximum word must still reach interval + jitter, not
+        // stop at the interval.
+        let base = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 7, 12, 0, 0).unwrap();
+        let schedule = sched("30min", "2h");
+        let mut low = rand::rngs::mock::StepRng::new(0, 0);
+        assert_eq!(next_run_from(base, &schedule, &mut low), base);
+        let mut high = rand::rngs::mock::StepRng::new(u64::MAX, 0);
+        assert_eq!(
+            next_run_from(base, &schedule, &mut high),
+            base + chrono::Duration::minutes(30) + chrono::Duration::hours(2)
+        );
+    }
+
+    #[test]
+    fn format_plan_treats_a_partial_overdue_minute_as_zero() {
+        // num_minutes truncates toward zero, so 59s overdue is `in 0m`.
+        // A full minute overdue is the first bucket that says `due now`.
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 7, 12, 0, 0).unwrap();
+        let partial = format_plan(
+            &[PlanEntry {
+                target: "partial".into(),
+                next_run: now - chrono::Duration::seconds(59),
+                freshly_scheduled: false,
+            }],
+            now,
+        );
+        assert!(partial.contains("in 0m"), "{partial}");
+        assert!(!partial.contains("due now"), "{partial}");
+
+        let minute = format_plan(
+            &[PlanEntry {
+                target: "minute".into(),
+                next_run: now - chrono::Duration::seconds(60),
+                freshly_scheduled: false,
+            }],
+            now,
+        );
+        assert!(minute.contains("due now"), "{minute}");
+        assert!(!minute.contains("in -"), "{minute}");
+        assert!(!minute.contains("in 1m"), "{minute}");
+    }
 }

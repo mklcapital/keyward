@@ -577,4 +577,44 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn leading_whitespace_policy_json_is_preserved() {
+        // serde_json accepts leading whitespace. A pretty-printed one-bucket
+        // policy must be copied. Falling back would swap in read access to
+        // every bucket in the account.
+        let raw = "raw-token-not-in-body";
+        let policy = "\n[{\"effect\":\"allow\",\"resources\":{\"bucket-one\":\"read\"}}]";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": raw, "name": "kw" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let like = KeyInfo {
+            key_id: "tok-old".into(),
+            capabilities: vec![policy.into()],
+            ..KeyInfo::default()
+        };
+        let cred = prov.create_key(&mgmt(), "kw", Some(&like)).await.unwrap();
+        assert_eq!(cred.key_id, "tok-new");
+        assert_ne!(cred.secret, raw);
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert!(req.url.ends_with("/accounts/acct-123/tokens"), "{}", req.url);
+        let body = req.body.clone().unwrap();
+        assert_eq!(
+            body["policies"],
+            json!([{ "effect": "allow", "resources": { "bucket-one": "read" } }])
+        );
+        let recorded = body["policies"].to_string();
+        assert_eq!(cred.extra.get("policies").map(String::as_str), Some(recorded.as_str()));
+        let rendered = body.to_string();
+        assert!(!rendered.contains(R2_READ_PERMISSION_GROUP), "{rendered}");
+        assert!(!rendered.contains("com.cloudflare.edge.r2.bucket.*"), "{rendered}");
+        assert!(!rendered.contains(raw), "{rendered}");
+        assert!(!rendered.contains("mgmt-token-value"), "{rendered}");
+        assert!(!req.url.contains(raw), "{}", req.url);
+        assert!(!req.url.contains("mgmt-token-value"), "{}", req.url);
+    }
 }

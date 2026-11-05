@@ -990,4 +990,80 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn session_token_with_crlf_stays_one_signed_header() {
+        // A CR/LF inside the session token must not become a second header.
+        // The signature has to cover the raw token, newline included.
+        let token = "FwoG\r\nAuthorization: forged";
+        let mut cred = mgmt();
+        cred.extra.insert("session_token".into(), token.into());
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let keys = prov.list_keys(&cred).await.unwrap();
+        assert!(keys.is_empty());
+
+        let req = prov.transport.last();
+        assert_eq!(
+            req.body,
+            "Action=ListAccessKeys&UserName=svc-backups&Version=2010-05-08"
+        );
+        assert!(!req.body.contains("wJalrXUtnFEMI/EXAMPLEKEY"), "body: {}", req.body);
+        assert!(!req.body.contains("forged"), "body: {}", req.body);
+        assert!(!req.body.contains('\n'), "body: {}", req.body);
+
+        let token_headers: Vec<_> = req
+            .headers
+            .iter()
+            .filter(|(k, _)| k == "x-amz-security-token")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(token_headers, vec![token]);
+        assert!(req.headers.iter().all(|(k, _)| !k.contains('\n') && !k.contains('\r')));
+
+        let auth_headers: Vec<_> = req
+            .headers
+            .iter()
+            .filter(|(k, _)| k == "authorization")
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(auth_headers.len(), 1, "headers: {:?}", req.headers);
+        assert!(!auth_headers[0].contains("forged"), "{}", auth_headers[0]);
+        assert!(!auth_headers[0].contains("wJalrXUtnFEMI/EXAMPLEKEY"), "{}", auth_headers[0]);
+        assert!(
+            auth_headers[0].contains("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token"),
+            "{}",
+            auth_headers[0]
+        );
+
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let expected = sigv4::sign_query_post(
+            IAM_ENDPOINT,
+            "iam",
+            AWS_REGION,
+            &cred.key_id,
+            &cred.secret,
+            Some(token),
+            &req.body,
+            now,
+        )
+        .unwrap();
+        let expected_auth = expected.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        assert_eq!(auth_headers[0], expected_auth);
+
+        let stripped = sigv4::sign_query_post(
+            IAM_ENDPOINT,
+            "iam",
+            AWS_REGION,
+            &cred.key_id,
+            &cred.secret,
+            Some("FwoGAuthorization: forged"),
+            &req.body,
+            now,
+        )
+        .unwrap();
+        let stripped_auth = stripped.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        assert_ne!(auth_headers[0], stripped_auth, "dropping the CR/LF must change the signature");
+    }
 }
