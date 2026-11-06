@@ -328,4 +328,21 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn binary_plaintext_round_trips_and_is_absent_from_ciphertext_and_json_errors() {
+        let kp = KeyPair::generate();
+        let secret = b"caf\xc3\xa9-PLAINTEXT-SECRET-MARKER\0tail";
+        let env = Envelope::seal("db/meta", &kp, secret).unwrap();
+        let raw = unb64(&env.ciphertext_b64).unwrap();
+        assert!(!raw.windows(secret.len()).any(|w| w == secret));
+        assert!(!env.ciphertext_b64.contains("PLAINTEXT-SECRET-MARKER"));
+        assert_eq!(env.label, "db/meta");
+        assert_eq!(env.open(&kp).unwrap(), secret);
+        let err = env.open_json::<serde_json::Value>(&kp).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("deserializing decrypted JSON payload"), "{msg}");
+        assert!(!msg.contains("PLAINTEXT-SECRET-MARKER"), "{msg}");
+        assert!(!msg.contains("caf"), "{msg}");
+    }
 }

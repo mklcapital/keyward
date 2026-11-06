@@ -577,4 +577,61 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn null_policies_are_not_stored_as_the_string_null() {
+        // An explicit JSON null is "no policy", not the capability text "null"
+        // that a later copy could treat as scope.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!([
+                { "id": "tok-a", "name": "alpha", "policies": null },
+            ])),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let keys = prov.list_keys(&mgmt()).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_id, "tok-a");
+        assert!(keys[0].capabilities.is_empty(), "got {:?}", keys[0].capabilities);
+        assert!(!keys[0].capabilities.iter().any(|c| c.contains("null")));
+    }
+
+    #[tokio::test]
+    async fn verify_accepts_http_399_and_rejects_http_400_without_echoing_the_token() {
+        // The verify bearer is the new token value. 399 is still success;
+        // 400 must fail closed and must not echo that value or its digest.
+        let raw = "raw-token-secret-verify";
+        let digest = Cloudflare::<FakeTransport>::derive_secret_access_key(raw);
+        let mut cred = Credential::new("tok", "s3-secret-derived");
+        cred.extra.insert("account_id".into(), "acct-123".into());
+        cred.extra.insert("cf_token_value".into(), raw.into());
+
+        let ok = Cloudflare::with_transport(FakeTransport::new(vec![FakeTransport::ok(
+            399,
+            envelope(json!({ "status": "active", "value": raw })),
+        )]));
+        ok.verify_key(&cred).await.unwrap();
+        let req = ok.transport.last();
+        assert_eq!(req.method, "GET");
+        assert!(req.url.ends_with("/accounts/acct-123/tokens/verify"), "{}", req.url);
+        assert_eq!(req.bearer.as_deref(), Some(raw));
+        assert_ne!(req.bearer.as_deref(), Some("s3-secret-derived"));
+        assert!(req.body.is_none());
+
+        let bad = Cloudflare::with_transport(FakeTransport::new(vec![FakeTransport::ok(
+            400,
+            json!({
+                "success": true,
+                "errors": [{ "code": 1000, "message": "nope" }],
+                "result": { "status": "active", "value": raw }
+            }),
+        )]));
+        let err = bad.verify_key(&cred).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 400"), "{msg}");
+        assert!(!msg.contains(raw), "{msg}");
+        assert!(!msg.contains(&digest), "{msg}");
+        assert!(!msg.contains("s3-secret-derived"), "{msg}");
+        assert!(!msg.contains("mgmt-token-value"), "{msg}");
+    }
 }

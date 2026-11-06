@@ -428,4 +428,44 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[tokio::test]
+    async fn empty_state_file_fails_to_load_and_does_not_fire() {
+        // A missing file is a fresh plan. A zero-byte file is a torn write and
+        // must not be treated as "no schedule", which would re-roll every target.
+        let cfg = cfg_with(vec![("t", Some(sched("30d", "0s")))]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        std::fs::write(&path, "").unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let hook = CountingHook {
+            count: count.clone(),
+            fired: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let err = run(&cfg, &path, &hook, Some(1)).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parsing state"), "{msg}");
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn format_plan_keeps_a_long_target_name() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let name = "prod-backup-key-east-primary";
+        assert!(name.len() > 20, "the fixture must exceed the column width");
+        let fresh = PlanEntry {
+            target: name.into(),
+            next_run: now + chrono::Duration::minutes(2),
+            freshly_scheduled: true,
+        };
+        let persisted = PlanEntry { freshly_scheduled: false, ..fresh.clone() };
+        let text = format_plan(&[fresh, persisted], now);
+        assert_eq!(text.matches(name).count(), 2, "{text}");
+        assert!(text.contains("in 2m"), "{text}");
+        assert!(text.contains("[new]"), "{text}");
+        assert!(text.contains("[persisted]"), "{text}");
+        assert!(!text.contains("due now"), "{text}");
+    }
 }
