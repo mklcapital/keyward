@@ -990,4 +990,104 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn truncated_list_with_one_key_does_not_delete_it() {
+        // IAM's IsTruncated flag is not a key count. One visible key is under
+        // the 2-key cap, so make-room must not delete it even if the page says
+        // the list is incomplete.
+        let xml = list_keys_xml(&[("AKIAACTIVE", "Active", "2026-06-01T00:00:00Z")])
+            .replace("<IsTruncated>false</IsTruncated>", "<IsTruncated>true</IsTruncated>");
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &xml),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, "brand-new-secret");
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list then create; no delete");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=CreateAccessKey"));
+        assert!(!seen.iter().any(|r| r.body.contains("DeleteAccessKey")));
+        assert!(!seen.iter().any(|r| r.body.contains("AKIAACTIVE") && r.body.contains("Delete")));
+        assert!(!seen.iter().any(|r| {
+            r.body.contains("brand-new-secret")
+                || r.headers.iter().any(|(_, v)| v.contains("brand-new-secret"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn mixed_case_inactive_status_is_verbatim_and_is_the_make_room_victim() {
+        // Activity is case-insensitive, but the stored status string is not
+        // rewritten. Only the mixed-case inactive key may be deleted.
+        let xml = list_keys_xml(&[
+            ("AKIAACTIVE", "Active", "2026-06-01T00:00:00Z"),
+            ("AKIAMIXED", "InAcTiVe", "2026-01-01T00:00:00Z"),
+        ]);
+        let listed = Aws::with_transport(FakeTransport::new(vec![FakeTransport::ok(200, &xml)]));
+        let keys = listed.list_keys(&mgmt()).await.unwrap();
+        assert_eq!(keys[1].key_id, "AKIAMIXED");
+        assert_eq!(keys[1].capabilities, vec!["status:InAcTiVe".to_string()]);
+        assert_ne!(keys[1].capabilities, vec!["status:inactive".to_string()]);
+        assert!(keys[1].bucket_id.is_none());
+        assert!(keys[0].bucket_id.is_none());
+
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &xml),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete, create");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIAMIXED"));
+        assert_eq!(seen[1].body.matches("AccessKeyId=").count(), 1);
+        assert!(!seen[1].body.contains("AKIAACTIVE"));
+        assert!(!seen.iter().any(|r| r.body.contains("brand-new-secret")));
+    }
+
+    #[tokio::test]
+    async fn create_key_does_not_copy_like_scope_into_the_request_or_credential() {
+        // IAM permissions live on the user, not the key. A sibling policy or
+        // bucket id must not be sent, and must not be attached to the secret.
+        let like = KeyInfo {
+            key_id: "AKIAOLD".into(),
+            name: Some("admin-policy".into()),
+            capabilities: vec!["arn:aws:iam::aws:policy/AdministratorAccess".into()],
+            bucket_id: Some("bucket-secret".into()),
+        };
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-name-not-a-user", Some(&like)).await.unwrap();
+        let extra_keys: Vec<_> = cred.extra.keys().cloned().collect();
+        assert_eq!(
+            extra_keys,
+            vec![
+                "iam_user".to_string(),
+                "region".to_string(),
+                "rotation_model".to_string(),
+            ]
+        );
+        assert_eq!(cred.extra.get("iam_user").map(String::as_str), Some("svc-backups"));
+        assert_eq!(cred.extra.get("region").map(String::as_str), Some("us-east-1"));
+        assert!(!cred.extra.values().any(|v| v.contains("AdministratorAccess") || v.contains("bucket-secret")));
+        for req in prov.transport.seen() {
+            assert!(!req.body.contains("AdministratorAccess"), "{}", req.body);
+            assert!(!req.body.contains("bucket-secret"), "{}", req.body);
+            assert!(!req.body.contains("kw-name-not-a-user"), "{}", req.body);
+            assert!(!req.body.contains("admin-policy"), "{}", req.body);
+            assert!(!req.body.contains("brand-new-secret"), "{}", req.body);
+            assert_eq!(req.body.matches("UserName=").count(), 1, "{}", req.body);
+            assert_eq!(req.body.matches("Action=").count(), 1, "{}", req.body);
+        }
+    }
 }
