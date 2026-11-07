@@ -577,4 +577,89 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn array_create_result_does_not_mint_or_echo_the_token() {
+        // A list is not a token object. Indexing it must fail closed before
+        // any id or value is stored, and the error must not dump the element.
+        let raw = "RAW-ARRAY-TOKEN-LEAK";
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key(raw);
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!([{ "id": "tok-new", "value": raw }])),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no `id` in result"), "{msg}");
+        assert!(!msg.contains(raw), "{msg}");
+        assert!(!msg.contains(&digest), "{msg}");
+        assert!(!msg.contains("mgmt-token-value"), "{msg}");
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.unwrap().to_string();
+        assert!(!body.contains(raw), "{body}");
+        assert!(!req.url.contains(raw), "{}", req.url);
+    }
+
+    #[tokio::test]
+    async fn token_value_is_hashed_as_utf8_without_trimming() {
+        // R2's secret is sha256 of the token bytes. A trailing newline and a
+        // non-ASCII character are part of the input; stripping or latin1
+        // would store a secret Cloudflare will not accept.
+        let raw = "caf\u{e9}\n";
+        let digest = "7b49b9e063bd91a4f9252b413261f5557b9c570aa61516989499f64a62dbcdd6";
+        assert_ne!(digest, Cloudflare::<ReqwestTransport>::derive_secret_access_key("caf\u{e9}"));
+        assert_ne!(digest, Cloudflare::<ReqwestTransport>::derive_secret_access_key("cafe\n"));
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": raw })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "tok-new");
+        assert_eq!(cred.secret, digest);
+        assert_eq!(cred.extra.get("cf_token_value").map(String::as_str), Some(raw));
+        assert_ne!(cred.secret, raw);
+        let req = prov.transport.last();
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        assert!(!req.url.contains(raw), "{}", req.url);
+        assert!(!req.url.contains(digest), "{}", req.url);
+        let body = req.body.unwrap().to_string();
+        assert!(!body.contains(raw), "{body}");
+        assert!(!body.contains(digest), "{body}");
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_success_false_even_when_status_is_active() {
+        // `status: active` is only meaningful inside a success envelope.
+        // A logical error must not verify, and must not echo the token.
+        let raw = "raw-token-secret-verify";
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key(raw);
+        let mut cred = Credential::new("tok", "s3-secret-derived");
+        cred.extra.insert("account_id".into(), "acct-123".into());
+        cred.extra.insert("cf_token_value".into(), raw.into());
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({
+                "success": false,
+                "errors": [{ "code": 1000, "message": "token disabled" }],
+                "result": { "status": "active", "value": raw }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.verify_key(&cred).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("token disabled"), "{msg}");
+        assert!(msg.contains("[1000]"), "{msg}");
+        assert!(!msg.contains("not active"), "{msg}");
+        assert!(!msg.contains(raw), "{msg}");
+        assert!(!msg.contains(&digest), "{msg}");
+        assert!(!msg.contains("s3-secret-derived"), "{msg}");
+        assert!(!msg.contains("mgmt-token-value"), "{msg}");
+        let req = prov.transport.last();
+        assert_eq!(req.bearer.as_deref(), Some(raw));
+        assert!(req.url.ends_with("/accounts/acct-123/tokens/verify"), "{}", req.url);
+    }
 }

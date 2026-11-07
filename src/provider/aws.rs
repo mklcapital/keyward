@@ -990,4 +990,93 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn minted_credential_does_not_keep_the_management_session_or_secret() {
+        // The management session token signs the call. It must not be copied
+        // onto the key we store, and neither management secret may leave the
+        // signer as a form field or an Authorization parameter.
+        let mut mgmt = mgmt();
+        let mgmt_secret = "wJalr-MGMT-SECRET-DO-NOT-STORE";
+        let session = "FwoG-MGMT-SESSION-DO-NOT-STORE";
+        mgmt.secret = mgmt_secret.into();
+        mgmt.extra.insert("session_token".into(), session.into());
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "new-secret-once")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt, "kw", None).await.unwrap();
+
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, "new-secret-once");
+        let extra_keys: Vec<_> = cred.extra.keys().cloned().collect();
+        assert_eq!(
+            extra_keys,
+            vec![
+                "iam_user".to_string(),
+                "region".to_string(),
+                "rotation_model".to_string(),
+            ]
+        );
+        assert_eq!(cred.extra.get("iam_user").map(String::as_str), Some("svc-backups"));
+        assert_eq!(cred.extra.get("region").map(String::as_str), Some("us-east-1"));
+        for value in cred.extra.values() {
+            assert!(!value.contains("MGMT-SECRET"), "{value}");
+            assert!(!value.contains("MGMT-SESSION"), "{value}");
+            assert!(!value.contains("new-secret-once"), "{value}");
+        }
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list then create; no make-room delete");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=CreateAccessKey"));
+        assert!(!seen.iter().any(|r| r.body.contains("Action=DeleteAccessKey")));
+        for req in &seen {
+            assert!(!req.body.contains(mgmt_secret), "{}", req.body);
+            assert!(!req.body.contains(session), "{}", req.body);
+            assert!(!req.body.contains("new-secret-once"), "{}", req.body);
+            assert!(!req.body.contains("SessionToken"), "{}", req.body);
+            let tokens: Vec<_> = req
+                .headers
+                .iter()
+                .filter(|(k, _)| k == "x-amz-security-token")
+                .map(|(_, v)| v.as_str())
+                .collect();
+            assert_eq!(tokens, vec![session]);
+            let auth = req.headers.iter().find(|(k, _)| k == "authorization").unwrap().1.as_str();
+            assert!(!auth.contains(session), "{auth}");
+            assert!(!auth.contains(mgmt_secret), "{auth}");
+            assert!(!auth.contains("new-secret-once"), "{auth}");
+        }
+    }
+
+    #[tokio::test]
+    async fn namespaced_create_tags_do_not_mint_or_echo_the_secret() {
+        // The extractor matches `<AccessKeyId>` exactly. A namespaced tag is
+        // not a credential, and its secret must not surface in the error.
+        let leaked = "LEAKED-NAMESPACE-SECRET";
+        let body = format!(
+            "<CreateAccessKeyResponse><CreateAccessKeyResult><AccessKey>\
+             <UserName>admin</UserName>\
+             <iam:AccessKeyId>AKIAGOOD</iam:AccessKeyId>\
+             <iam:SecretAccessKey>{leaked}</iam:SecretAccessKey>\
+             </AccessKey></CreateAccessKeyResult></CreateAccessKeyResponse>"
+        );
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[])),
+            FakeTransport::ok(200, &body),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing AccessKeyId/SecretAccessKey"), "{msg}");
+        assert!(!msg.contains(leaked), "{msg}");
+        assert!(!msg.contains("AKIAGOOD"), "{msg}");
+        assert!(!msg.contains("wJalr"), "{msg}");
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2);
+        assert!(!seen.iter().any(|r| r.body.contains("Action=DeleteAccessKey")));
+        assert!(!seen.iter().any(|r| r.body.contains(leaked)));
+    }
 }

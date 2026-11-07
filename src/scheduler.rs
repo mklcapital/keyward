@@ -428,4 +428,48 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn sub_second_jitter_uses_both_ends_of_the_window() {
+        // Hour-scale cases still pass if the delay is truncated to whole
+        // seconds. A 1s interval with ±500ms must land on 500ms and 1500ms.
+        let base = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 7, 12, 0, 0).unwrap();
+        let low = next_run_from(
+            base,
+            &sched("1s", "500ms"),
+            &mut rand::rngs::mock::StepRng::new(0, 0),
+        );
+        let high = next_run_from(
+            base,
+            &sched("1s", "500ms"),
+            &mut rand::rngs::mock::StepRng::new(u64::MAX, 0),
+        );
+        assert_eq!(low, base + chrono::Duration::milliseconds(500));
+        assert_eq!(high, base + chrono::Duration::milliseconds(1500));
+        assert!(low > base, "negative jitter shortens the interval but stays after base");
+    }
+
+    #[tokio::test]
+    async fn directory_state_path_is_a_read_error_and_is_not_replaced() {
+        // KEYWARD_STATE pointing at a directory must not be treated as a
+        // missing file (which would start empty) and must not be overwritten.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state-dir");
+        std::fs::create_dir(&state_dir).unwrap();
+        let sentinel = state_dir.join("sentinel");
+        std::fs::write(&sentinel, b"keep-me").unwrap();
+
+        let cfg = cfg_with(vec![("t", Some(sched("30d", "0s")))]);
+        let count = Arc::new(AtomicUsize::new(0));
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = CountingHook { count: count.clone(), fired };
+        let err = run(&cfg, &state_dir, &hook, Some(1)).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("reading state"), "{msg}");
+        assert!(!msg.contains("parsing state"), "{msg}");
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(state_dir.is_dir());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep-me");
+        assert!(!dir.path().join("schedule.json").exists());
+    }
 }
