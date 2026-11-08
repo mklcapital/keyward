@@ -428,4 +428,35 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn fractional_next_run_survives_load_and_save() {
+        // A sub-second stamp must not be truncated to the whole second, or a
+        // restart would move the fire time.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        std::fs::write(
+            &path,
+            r#"{"next_run":{"prod":"2026-07-07T12:00:00.123456789Z"},"last_run":{"prod":"2026-07-07T11:00:00.5Z"}}"#,
+        )
+        .unwrap();
+
+        let loaded = State::load(&path).unwrap();
+        let next = loaded.next_run["prod"];
+        let last = loaded.last_run["prod"];
+        assert_eq!(next.timestamp_subsec_nanos(), 123_456_789);
+        assert_eq!(last.timestamp_subsec_nanos(), 500_000_000);
+        let whole = chrono::DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_ne!(next, whole);
+
+        loaded.save(&path).unwrap();
+        let again = State::load(&path).unwrap();
+        assert_eq!(again.next_run["prod"], next);
+        assert_eq!(again.last_run["prod"], last);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("123456789"), "{saved}");
+        assert_eq!(saved.matches("\"next_run\"").count(), 1, "{saved}");
+    }
 }

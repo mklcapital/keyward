@@ -990,4 +990,75 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn create_key_accepts_http_201_and_keeps_the_secret_out_of_the_request() {
+        // IAM documents 200, but any 2xx is success. Requiring exactly 200 would
+        // drop a key that was actually minted and return the secret in the error.
+        let secret = "created-once/secret==";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[])),
+            FakeTransport::ok(201, &create_key_xml("AKIANEW", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list, then create; no delete under the cap");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=CreateAccessKey"));
+        assert!(!seen.iter().any(|r| r.body.contains("Action=DeleteAccessKey")));
+        assert!(!seen.iter().any(|r| r.body.contains(secret)), "secret must not be a form field");
+        assert!(
+            !seen.iter().any(|r| r.headers.iter().any(|(_, v)| v.contains(secret))),
+            "secret must not be a signed header"
+        );
+        let auth = seen[1].headers.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        assert!(auth.contains("Credential=AKIAEXAMPLEMGMT/"), "sign with the management key: {auth}");
+        assert!(!auth.contains("AKIANEW"), "the new key must not sign its own create");
+    }
+
+    #[tokio::test]
+    async fn revoke_key_accepts_http_204() {
+        // Deactivation is the grace window. A 204 with an empty body is still
+        // success; treating only 200 as success would leave the old key Active.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(204, "")]);
+        let prov = Aws::with_transport(fake);
+        prov.revoke_key(&mgmt(), "AKIAOLD").await.unwrap();
+        let req = prov.transport.last();
+        assert!(req.body.contains("Action=UpdateAccessKey"), "got: {}", req.body);
+        assert!(req.body.contains("Status=Inactive"));
+        assert!(req.body.contains("AccessKeyId=AKIAOLD"));
+        assert!(!req.body.contains("DeleteAccessKey"));
+        assert!(!req.body.contains("wJalrXUtnFEMI/EXAMPLEKEY"));
+    }
+
+    #[test]
+    fn a_host_without_a_trailing_slash_signs_like_one_with_it() {
+        use chrono::TimeZone;
+        let date = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let sign = |endpoint: &str| {
+            sigv4::sign_query_post(
+                endpoint,
+                "iam",
+                "us-east-1",
+                "AKIDEXAMPLE",
+                secret,
+                None,
+                "Action=ListAccessKeys&Version=2010-05-08",
+                date,
+            )
+            .unwrap()
+        };
+        let bare = sign("https://iam.amazonaws.com");
+        let slash = sign("https://iam.amazonaws.com/");
+        assert_eq!(bare, slash, "a missing trailing slash must not change the canonical URI");
+        let host = bare.iter().find(|(k, _)| k == "host").map(|(_, v)| v.as_str());
+        assert_eq!(host, Some("iam.amazonaws.com"));
+        assert!(!bare.iter().any(|(_, v)| v.contains(secret)));
+        assert!(!bare.iter().any(|(_, v)| v.contains("ListAccessKeys")));
+    }
 }
