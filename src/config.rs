@@ -73,3 +73,35 @@ pub fn load(path: &str) -> Result<Config> {
     let s = std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
     toml::from_str(&s).context("parsing config TOML")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_accepts_week_and_minute_units() {
+        // The config docs promise humantime units, including "1week" and "90min".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyward.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[target]]
+            name = "weekly"
+            provider = "aws"
+            vault = "Work"
+            item = "svc"
+            management_item = "mgmt"
+
+            [target.schedule]
+            interval = "1week"
+            jitter = "90min"
+            "#,
+        )
+        .unwrap();
+        let cfg = load(path.to_str().unwrap()).unwrap();
+        let sched = cfg.target[0].schedule.as_ref().unwrap();
+        assert_eq!(sched.interval, std::time::Duration::from_secs(7 * 24 * 3600));
+        assert_eq!(sched.jitter, std::time::Duration::from_secs(90 * 60));
+    }
+}

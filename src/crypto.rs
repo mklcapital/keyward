@@ -328,4 +328,26 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn surrounding_space_on_identity_and_recipient_is_rejected() {
+        // A pasted key often picks up a space. Trimming would accept it; the
+        // parser must fail closed, and the error must not echo the key.
+        let kp = KeyPair::generate();
+        let ident = kp.identity_str();
+        let recip = kp.recipient_str();
+        let err = match KeyPair::from_identity_str(&format!(" {ident}")) {
+            Ok(_) => panic!("leading space on an identity must be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid age identity"), "{msg}");
+        assert!(!msg.contains(&ident), "{msg}");
+        let err = Envelope::seal_to_recipient("t", &format!("{recip} "), b"recipe").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid age recipient"), "{msg}");
+        assert!(!msg.contains(&recip), "{msg}");
+        assert!(KeyPair::from_identity_str(&ident).is_ok());
+        assert!(Envelope::seal_to_recipient("t", &recip, b"recipe").is_ok());
+    }
 }

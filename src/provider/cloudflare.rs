@@ -577,4 +577,51 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn a_top_level_token_value_does_not_mint() {
+        // The S3 secret is sha256 of result.value only. A sibling `value` outside
+        // `result` must not become a credential, and must not be echoed.
+        let leak = "RAW-TOP-LEVEL-TOKEN";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({
+                "success": true,
+                "errors": [],
+                "result": { "id": "tok-new" },
+                "value": leak,
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no `value`"), "{msg}");
+        assert!(!msg.contains(leak), "{msg}");
+        assert!(!msg.contains("mgmt-token-value"), "{msg}");
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key(leak);
+        assert!(!msg.contains(&digest), "{msg}");
+        // A second call would panic: only one response was scripted.
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert!(req.url.ends_with("/accounts/acct-123/tokens"));
+        let body = req.body.unwrap().to_string();
+        assert!(!body.contains(leak), "{body}");
+    }
+
+    #[tokio::test]
+    async fn revoke_accepts_http_204_with_a_null_result() {
+        // A successful delete may have an empty result. Requiring result.id
+        // would fail the revoke and leave the old token live.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            204,
+            json!({ "success": true, "errors": [], "result": null }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        prov.revoke_key(&mgmt(), "tok-old").await.unwrap();
+        let req = prov.transport.last();
+        assert_eq!(req.method, "DELETE");
+        assert!(req.url.ends_with("/accounts/acct-123/tokens/tok-old"));
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        assert!(req.body.is_none());
+    }
 }
