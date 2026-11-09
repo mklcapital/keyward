@@ -428,4 +428,80 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn duplicate_target_names_keep_the_first_interval() {
+        // The state map is keyed by name. The first target writes next_run;
+        // a later target with the same name must not roll a second slot.
+        use chrono::TimeZone;
+        let cfg = cfg_with(vec![
+            ("dup", Some(sched("1d", "0s"))),
+            ("dup", Some(sched("30d", "0s"))),
+        ]);
+        let mut state = State::default();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let now = Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let planned = plan(&cfg, &mut state, now, &mut rng);
+        assert_eq!(planned.len(), 2);
+        assert_eq!(planned[0].target, "dup");
+        assert_eq!(planned[1].target, "dup");
+        assert!(planned[0].freshly_scheduled);
+        assert!(!planned[1].freshly_scheduled, "the second copy must reuse the first slot");
+        let first_slot = now + chrono::Duration::days(1);
+        assert_eq!(planned[0].next_run, first_slot);
+        assert_eq!(planned[1].next_run, first_slot);
+        assert_eq!(state.next_run.len(), 1);
+        assert_eq!(state.next_run["dup"], first_slot);
+
+        let again = plan(&cfg, &mut state, now, &mut rng);
+        assert!(!again[0].freshly_scheduled);
+        assert!(!again[1].freshly_scheduled);
+        assert_eq!(again[0].next_run, first_slot);
+        assert_eq!(state.next_run.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_target_names_fire_once_on_the_last_schedule() {
+        // `run` indexes targets by name. The last config entry is the one
+        // that fires, and its interval is what gets persisted afterward.
+        let mut cfg = cfg_with(vec![
+            ("dup", Some(sched("1d", "0s"))),
+            ("dup", Some(sched("30d", "0s"))),
+        ]);
+        cfg.target[0].key_name_prefix = "first-prefix".into();
+        cfg.target[1].key_name_prefix = "last-prefix".into();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let mut state = State::default();
+        state.next_run.insert("dup".into(), Utc::now() - chrono::Duration::seconds(5));
+        state.save(&path).unwrap();
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        struct PrefixHook {
+            seen: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl RotateHook for PrefixHook {
+            async fn fire(&self, target: &Target) -> Result<()> {
+                self.seen.lock().unwrap().push(target.key_name_prefix.clone());
+                Ok(())
+            }
+        }
+
+        let hook = PrefixHook { seen: seen.clone() };
+        let n = run(&cfg, &path, &hook, Some(1)).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["last-prefix"]);
+
+        let after = State::load(&path).unwrap();
+        assert_eq!(after.last_run.len(), 1);
+        assert!(after.last_run.contains_key("dup"));
+        let next = after.next_run["dup"];
+        // 30d from the fire, not the first target's 1d interval.
+        assert!(next > Utc::now() + chrono::Duration::days(29));
+        assert!(next < Utc::now() + chrono::Duration::days(31));
+    }
 }

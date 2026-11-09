@@ -577,4 +577,50 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn list_keys_accepts_http_399_and_hides_a_400_body() {
+        // Scope discovery uses this list. 399 is still success. 400 with
+        // success:true must not come back as keys, and the token name in
+        // that body must not be echoed into the error.
+        let name = "ADMIN-TOKEN-NAME";
+        let ok = FakeTransport::new(vec![FakeTransport::ok(
+            399,
+            envelope(json!([
+                { "id": "tok-399", "name": name, "policies": [{ "effect": "allow" }] },
+            ])),
+        )]);
+        let prov = Cloudflare::with_transport(ok);
+        let keys = prov.list_keys(&mgmt()).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_id, "tok-399");
+        assert_eq!(keys[0].name.as_deref(), Some(name));
+        assert_eq!(keys[0].capabilities.len(), 1);
+        let req = prov.transport.last();
+        assert_eq!(req.method, "GET");
+        assert!(req.url.ends_with("/accounts/acct-123/tokens"));
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        assert!(!req.url.contains(name));
+
+        let denied = FakeTransport::new(vec![FakeTransport::ok(
+            400,
+            json!({
+                "success": true,
+                "errors": [{ "code": 1000, "message": "denied" }],
+                "result": [{
+                    "id": "tok-400",
+                    "name": name,
+                    "policies": [{ "effect": "allow", "note": name }]
+                }]
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(denied);
+        let err = prov.list_keys(&mgmt()).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 400"), "{msg}");
+        assert!(msg.contains("denied"), "{msg}");
+        assert!(!msg.contains(name), "{msg}");
+        assert!(!msg.contains("tok-400"), "{msg}");
+        assert!(!msg.contains("mgmt-token-value"), "{msg}");
+    }
 }
