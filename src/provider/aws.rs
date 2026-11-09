@@ -990,4 +990,44 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn make_room_delete_http_204_still_mints() {
+        // IAM DeleteAccessKey can answer 204 with an empty body. That is
+        // success: the inactive key is gone and the new secret is minted.
+        // A check for exactly HTTP 200 would free the slot and then refuse
+        // to create, leaving the user with one key and no replacement.
+        let secret = "brand-new-secret-204";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIAACTIVE", "Active", "2026-06-01T00:00:00Z"),
+                    ("AKIASTALE", "Inactive", "2026-01-01T00:00:00Z"),
+                ]),
+            ),
+            FakeTransport::ok(204, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete(make-room), create");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIASTALE"));
+        assert!(!seen[1].body.contains("AKIAACTIVE"));
+        assert!(seen[2].body.contains("Action=CreateAccessKey"));
+        let signing_secret = "wJalrXUtnFEMI/EXAMPLEKEY";
+        for req in &seen {
+            assert!(!req.body.contains(secret), "new secret leaked into {}", req.body);
+            assert!(!req.body.contains(signing_secret), "signing secret leaked into {}", req.body);
+            assert!(
+                !req.headers.iter().any(|(_, v)| v.contains(secret) || v.contains(signing_secret)),
+                "secret leaked into headers"
+            );
+        }
+    }
 }
