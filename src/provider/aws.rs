@@ -990,4 +990,62 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn list_failure_during_create_does_not_mint() {
+        // A failed ListAccessKeys must not be treated as "zero keys, go mint".
+        // The decoy secret sits outside <Code>/<Message> and must not be echoed.
+        let body = format!(
+            "{}<SecretAccessKey>LEAKED-LIST-SECRET</SecretAccessKey>",
+            error_xml("InternalError", "unavailable")
+        );
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(500, &body),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 500"), "{msg}");
+        assert!(msg.contains("InternalError: unavailable"), "{msg}");
+        assert!(!msg.contains("LEAKED-LIST-SECRET"), "{msg}");
+        assert!(!msg.contains("brand-new-secret"), "{msg}");
+        assert!(!msg.contains("wJalrXUtnFEMI/EXAMPLEKEY"), "{msg}");
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 1, "list failure must not continue to CreateAccessKey");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert_eq!(seen[0].body.matches("Action=").count(), 1, "{}", seen[0].body);
+        assert!(!seen[0].body.contains("CreateAccessKey"));
+        assert!(!seen[0].body.contains("wJalrXUtnFEMI/EXAMPLEKEY"));
+        assert!(seen[0].headers.iter().all(|(_, v)| !v.contains("wJalrXUtnFEMI/EXAMPLEKEY")));
+    }
+
+    #[tokio::test]
+    async fn namespaced_arn_does_not_verify() {
+        // Account and UserId, plus a namespaced Arn, are not a caller identity.
+        // Only an exact <Arn> element counts. The marker must not leak via the error.
+        let body = "<GetCallerIdentityResponse><GetCallerIdentityResult>\
+            <sts:Arn>ARN-SHOULD-NOT-LEAK</sts:Arn>\
+            <UserId>AIDAEXAMPLE</UserId><Account>123456789012</Account>\
+            </GetCallerIdentityResult></GetCallerIdentityResponse>";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, body)]);
+        let prov = Aws::with_transport(fake);
+        let secret = "new-secret-once";
+        let err = prov
+            .verify_key(&Credential::new("AKIANEW", secret))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no caller Arn"), "{msg}");
+        assert!(!msg.contains("ARN-SHOULD-NOT-LEAK"), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].url, STS_ENDPOINT);
+        assert!(seen[0].body.contains("Action=GetCallerIdentity"));
+        assert!(!seen[0].body.contains(secret));
+        assert!(seen[0].headers.iter().all(|(_, v)| !v.contains(secret)));
+        let auth = seen[0].headers.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        assert!(auth.contains("Credential=AKIANEW/"), "{auth}");
+    }
 }

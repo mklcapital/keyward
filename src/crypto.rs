@@ -328,4 +328,26 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn url_safe_ciphertext_does_not_open() {
+        // The envelope alphabet is standard base64. A URL-safe re-encode of the
+        // same bytes must fail closed and must not yield the plaintext.
+        let kp = KeyPair::generate();
+        let marker = b"PLAINTEXT-MARKER-url-safe";
+        let env = Envelope::seal("t/recipe", &kp, marker).unwrap();
+        let raw = unb64(&env.ciphertext_b64).unwrap();
+        use base64::Engine;
+        let mut swapped = env.clone();
+        swapped.ciphertext_b64 = base64::engine::general_purpose::URL_SAFE.encode(&raw);
+        assert_ne!(
+            swapped.ciphertext_b64, env.ciphertext_b64,
+            "fixture must use the URL-safe alphabet, not standard base64"
+        );
+        let err = swapped.open(&kp).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("base64"), "{msg}");
+        assert!(!msg.contains("PLAINTEXT-MARKER-url-safe"), "{msg}");
+        assert!(!swapped.ciphertext_b64.contains("PLAINTEXT-MARKER-url-safe"));
+    }
 }
