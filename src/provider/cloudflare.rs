@@ -577,4 +577,36 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn fractional_error_code_does_not_mint_or_round() {
+        // 1001.5 is not an integer code. It must not round to 1001, and a token
+        // parked on the error object or in result.value must not be minted or echoed.
+        let raw = "RAW-FRACTION-TOKEN";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({
+                "success": false,
+                "errors": [{ "code": 1001.5, "message": "invalid policy", "value": raw }],
+                "result": { "id": "tok-new", "value": raw }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key(raw);
+        assert!(msg.contains("[0] invalid policy"), "{msg}");
+        assert!(!msg.contains("1001"), "{msg}");
+        assert!(!msg.contains(raw), "{msg}");
+        assert!(!msg.contains(&digest), "{msg}");
+        assert!(!msg.contains("mgmt-token-value"), "{msg}");
+        assert!(!msg.contains("tok-new"), "{msg}");
+        let req = prov.transport.last();
+        assert_eq!(prov.transport.seen.lock().unwrap().len(), 1);
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.as_ref().unwrap().to_string();
+        assert!(!body.contains(raw));
+        assert!(!body.contains("mgmt-token-value"));
+    }
 }
