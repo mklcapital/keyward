@@ -577,4 +577,34 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_key_numeric_id_fails_closed_without_echoing_the_token() {
+        // A numeric `id` is not an S3 access key id. Stringifying it would mint
+        // a credential whose id is not the token id Cloudflare issued.
+        let raw = "RAW-NUMERIC-ID-TOKEN";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": 4242, "value": raw, "name": "kw" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no `id`"), "got: {msg}");
+        assert!(!msg.contains(raw), "got: {msg}");
+        assert!(!msg.contains("4242"), "got: {msg}");
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key(raw);
+        assert!(!msg.contains(&digest), "got: {msg}");
+        assert!(!msg.contains("mgmt-token-value"), "got: {msg}");
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(prov.transport.seen.lock().unwrap().len(), 1);
+        assert!(!req.url.contains(raw));
+        assert!(!req.url.contains("4242"));
+        let body = req.body.unwrap().to_string();
+        assert!(!body.contains(raw));
+        assert!(!body.contains(&digest));
+        assert!(!body.contains("mgmt-token-value"));
+    }
 }
