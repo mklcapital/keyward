@@ -328,4 +328,24 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn passphrase_trailing_newline_is_a_different_secret() {
+        // age uses the passphrase bytes as given. Trimming a trailing newline
+        // would open a different secret than the one the operator sealed.
+        let passphrase = "correct horse\n";
+        let marker = b"PLAINTEXT-MARKER-passphrase";
+        let env = Envelope::seal_with_passphrase("db/meta", passphrase, marker).unwrap();
+        assert_eq!(env.label, "db/meta");
+        assert_eq!(env.scheme, Scheme::AgeScrypt);
+        assert!(!env.ciphertext_b64.contains("correct horse"));
+        assert!(!env.ciphertext_b64.contains("PLAINTEXT-MARKER"));
+
+        let wrong = env.open_with_passphrase("correct horse").unwrap_err();
+        let msg = wrong.to_string();
+        assert!(!msg.contains("correct horse"), "got: {msg}");
+        assert!(!msg.contains("PLAINTEXT-MARKER"), "got: {msg}");
+
+        assert_eq!(env.open_with_passphrase(passphrase).unwrap(), marker);
+    }
 }
