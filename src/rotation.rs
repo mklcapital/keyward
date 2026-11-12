@@ -117,3 +117,106 @@ pub async fn rotate(t: &Target, store: &dyn SecretStore, opts: &Options) -> Resu
         sealed_recipe,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::build_recipe;
+    use crate::config::Target;
+    use crate::model::KeyInfo;
+
+    fn target() -> Target {
+        Target {
+            name: "b2-service".into(),
+            provider: "b2".into(),
+            vault: "Vault Name".into(),
+            item: "item/with space".into(),
+            field_key_id: "keyID".into(),
+            field_secret: "applicationKey".into(),
+            management_item: "mgmt-ADMIN-ITEM".into(),
+            mgmt_field_key_id: "keyID".into(),
+            mgmt_field_secret: "applicationKey".into(),
+            key_name_prefix: "keyward".into(),
+            schedule: None,
+            recipe_recipient: Some("age1SECRET-RECIPIENT-DO-NOT-COPY".into()),
+            console_url: Some("https://secure.backblaze.com/app_keys.htm".into()),
+        }
+    }
+
+    fn recipe_json(recipe: &crate::crypto::RecreationRecipe) -> String {
+        serde_json::to_string(recipe).unwrap()
+    }
+
+    #[test]
+    fn recipe_without_a_discovered_key_records_no_scope() {
+        let recipe = build_recipe(&target(), None);
+        assert_eq!(recipe.provider, "b2", "provider alias must not be rewritten");
+        assert_eq!(
+            recipe.console_url.as_deref(),
+            Some("https://secure.backblaze.com/app_keys.htm")
+        );
+        assert_eq!(recipe.login_reference.as_deref(), Some("op://Vault Name/item/with space"));
+        assert!(recipe.capabilities.is_empty(), "missing scope must not invent capabilities");
+        assert!(recipe.resource_restrictions.is_empty());
+        assert_eq!(recipe.notes, None);
+
+        let value = serde_json::to_value(&recipe).unwrap();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "capabilities".to_string(),
+                "console_url".to_string(),
+                "login_reference".to_string(),
+                "notes".to_string(),
+                "provider".to_string(),
+                "resource_restrictions".to_string(),
+            ]
+        );
+        let blob = recipe_json(&recipe);
+        for leaked in ["mgmt-ADMIN-ITEM", "age1SECRET-RECIPIENT-DO-NOT-COPY", "applicationKey"] {
+            assert!(!blob.contains(leaked), "recipe leaked {leaked}: {blob}");
+        }
+    }
+
+    #[test]
+    fn recipe_copies_capabilities_without_inventing_a_bucket() {
+        let like = KeyInfo {
+            key_id: "old-key".into(),
+            name: Some("do-not-copy-name".into()),
+            capabilities: vec!["readFiles".into(), "bucketId:not-a-restriction".into()],
+            bucket_id: None,
+        };
+        let recipe = build_recipe(&target(), Some(&like));
+        assert_eq!(
+            recipe.capabilities,
+            vec!["readFiles".to_string(), "bucketId:not-a-restriction".to_string()]
+        );
+        assert!(
+            recipe.resource_restrictions.is_empty(),
+            "a capability string is not a bucket restriction"
+        );
+        let blob = recipe_json(&recipe);
+        assert!(!blob.contains("old-key"), "{blob}");
+        assert!(!blob.contains("do-not-copy-name"), "{blob}");
+        assert!(!blob.contains("listBuckets"), "{blob}");
+        assert!(!blob.contains("listFiles"), "{blob}");
+    }
+
+    #[test]
+    fn recipe_copies_a_bucket_restriction_without_inventing_capabilities() {
+        let like = KeyInfo {
+            key_id: "old-key".into(),
+            name: None,
+            capabilities: vec![],
+            bucket_id: Some("bucket&id=admin".into()),
+        };
+        let recipe = build_recipe(&target(), Some(&like));
+        assert!(recipe.capabilities.is_empty(), "empty scope must not gain the read-only fallback");
+        assert_eq!(recipe.resource_restrictions, vec!["bucketId:bucket&id=admin".to_string()]);
+        let blob = recipe_json(&recipe);
+        for invented in ["listBuckets", "listFiles", "readFiles", "old-key"] {
+            assert!(!blob.contains(invented), "recipe invented {invented}: {blob}");
+        }
+    }
+}
