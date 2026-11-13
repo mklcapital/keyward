@@ -577,4 +577,65 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_response_policy_does_not_replace_the_copied_scope() {
+        // The create response is not a source of scope. A wider policy echoed
+        // there must not be what we store or what we send; the copied policy is.
+        let raw = "RAW-RESPONSE-TOKEN-VALUE";
+        let response_policy = "pg-FROM-RESPONSE-ADMIN";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({
+                "id": "tok-new",
+                "value": raw,
+                "name": "WIDER-ADMIN",
+                "policies": [{
+                    "effect": "allow",
+                    "permission_groups": [{ "id": response_policy }]
+                }],
+            })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let tight = json!([{
+            "effect": "allow",
+            "resources": { "com.cloudflare.edge.r2.bucket.one": "*" },
+            "permission_groups": [{ "id": "pg-tight" }]
+        }]);
+        let like = KeyInfo {
+            key_id: "tok-old".into(),
+            name: Some("old-name".into()),
+            capabilities: vec![tight.to_string()],
+            bucket_id: None,
+        };
+
+        let cred = prov.create_key(&mgmt(), "kw-copied", Some(&like)).await.unwrap();
+        assert_eq!(cred.key_id, "tok-new");
+        assert_eq!(
+            cred.secret,
+            Cloudflare::<ReqwestTransport>::derive_secret_access_key(raw)
+        );
+        assert_ne!(cred.secret, raw);
+        let stored: Value = serde_json::from_str(cred.extra.get("policies").expect("policies stored")).unwrap();
+        assert_eq!(stored, tight, "stored scope must be the copied policy, not the response");
+        assert_eq!(cred.extra.get("account_id").map(String::as_str), Some("acct-123"));
+        assert_eq!(cred.extra.get("cf_token_value").map(String::as_str), Some(raw));
+        for value in cred.extra.values() {
+            assert!(!value.contains(response_policy), "response policy stored in extras: {value}");
+        }
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.expect("create body");
+        assert_eq!(body["name"], "kw-copied");
+        assert_eq!(body["policies"], tight);
+        let rendered = body.to_string();
+        assert!(!rendered.contains(response_policy), "{rendered}");
+        assert!(!rendered.contains(raw), "{rendered}");
+        assert!(!rendered.contains("WIDER-ADMIN"), "{rendered}");
+        assert!(!rendered.contains(R2_READ_PERMISSION_GROUP), "copied scope must not also attach the fallback: {rendered}");
+        assert!(!req.url.contains(raw));
+        assert!(!req.url.contains(response_policy));
+    }
 }
