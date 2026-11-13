@@ -328,4 +328,24 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn open_json_rejects_a_partial_recipe_without_echoing_it() {
+        // A half-written recipe must not deserialize into a usable default
+        // (empty capabilities would look like "no scope recorded"). The
+        // plaintext marker stays inside the ciphertext and out of the error.
+        let kp = KeyPair::generate();
+        let marker = "SECRET-MARKER-partial-recipe";
+        let partial = format!(r#"{{"provider":"b2","notes":"{marker}"}}"#);
+        let env = Envelope::seal("b2/recipe", &kp, partial.as_bytes()).unwrap();
+        let err = env.open_json::<RecreationRecipe>(&kp).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("deserializing") || msg.contains("missing field"),
+            "{msg}"
+        );
+        assert!(!msg.contains(marker), "partial recipe leaked into the error: {msg}");
+        assert!(!env.ciphertext_b64.contains(marker));
+        assert_eq!(env.label, "b2/recipe");
+    }
 }

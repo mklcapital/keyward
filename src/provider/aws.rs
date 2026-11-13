@@ -990,4 +990,43 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn create_key_with_zero_existing_keys_mints_without_a_delete() {
+        // The first key on a user is under the cap. Treating "not exactly one
+        // key" as "make room" would refuse the initial rotation or issue a delete
+        // against an empty account.
+        let secret = "brand-new-secret-once/only==";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[])),
+            FakeTransport::ok(200, &create_key_xml("AKIAFIRST", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-ignored", None).await.unwrap();
+
+        assert_eq!(cred.key_id, "AKIAFIRST");
+        assert_eq!(cred.secret, secret);
+        assert_eq!(cred.extra.get("iam_user").map(String::as_str), Some("svc-backups"));
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list, then create — no delete");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"), "{}", seen[0].body);
+        assert!(seen[1].body.contains("Action=CreateAccessKey"), "{}", seen[1].body);
+        assert_eq!(seen[1].body.matches("Action=").count(), 1, "{}", seen[1].body);
+        assert_eq!(seen[1].body.matches("UserName=").count(), 1, "{}", seen[1].body);
+        assert!(seen[1].body.contains("UserName=svc-backups"), "{}", seen[1].body);
+        for req in &seen {
+            assert!(!req.body.contains("DeleteAccessKey"), "{}", req.body);
+            assert!(!req.body.contains(secret), "new secret leaked into the body: {}", req.body);
+            assert!(
+                !req.headers.iter().any(|(_, v)| v.contains(secret)),
+                "new secret leaked into a header"
+            );
+            assert!(
+                !req.body.contains("wJalrXUtnFEMI/EXAMPLEKEY") && !req.body.contains("wJalrXUtnFEMI%2FEXAMPLEKEY"),
+                "signing secret leaked into the body: {}",
+                req.body
+            );
+        }
+    }
 }
