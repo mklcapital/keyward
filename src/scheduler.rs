@@ -428,4 +428,41 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn empty_or_relative_keyward_state_is_not_the_default_path() {
+        // An empty or relative KEYWARD_STATE is the path itself. Treating
+        // either as "unset" would silently write the schedule under the
+        // operator's home directory instead of the path they named.
+        struct Restore {
+            previous: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(v) => std::env::set_var("KEYWARD_STATE", v),
+                    None => std::env::remove_var("KEYWARD_STATE"),
+                }
+            }
+        }
+        let _restore = Restore { previous: std::env::var_os("KEYWARD_STATE") };
+
+        std::env::remove_var("KEYWARD_STATE");
+        let fallback = default_state_path();
+        assert!(
+            fallback.ends_with("keyward/schedule.json"),
+            "unset KEYWARD_STATE was {fallback:?}"
+        );
+
+        std::env::set_var("KEYWARD_STATE", "not-absolute/schedule.json");
+        let relative = default_state_path();
+        assert_eq!(relative, PathBuf::from("not-absolute/schedule.json"));
+        assert!(!relative.is_absolute());
+        assert_ne!(relative, fallback);
+
+        std::env::set_var("KEYWARD_STATE", "");
+        let empty = default_state_path();
+        assert!(empty.as_os_str().is_empty(), "empty KEYWARD_STATE was {empty:?}");
+        assert_ne!(empty, fallback);
+    }
 }

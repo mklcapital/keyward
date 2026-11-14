@@ -34,3 +34,21 @@ pub fn get(name: &str) -> Result<Box<dyn Provider>> {
         other => anyhow::bail!("unknown provider: {other}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_names_are_case_sensitive() {
+        // Config typos must fail closed. Folding case would rotate a different
+        // provider than the one named in the file.
+        for name in ["AWS", "R2", "B2", "Cloudflare", "Backblaze"] {
+            let err = get(name).err().unwrap_or_else(|| panic!("{name} was accepted"));
+            let msg = err.to_string();
+            assert!(msg.contains("unknown provider"), "{name}: {msg}");
+            assert!(msg.contains(name), "{name}: {msg}");
+            assert!(!msg.contains("id="), "{name}: {msg}");
+        }
+    }
+}

@@ -577,4 +577,36 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn verify_key_rejects_an_expired_token_without_echoing_it() {
+        // Cloudflare's verify endpoint reports "expired" for a token that used
+        // to be live. That is not "active", and a `value` smuggled in the
+        // verify body must not be minted, sent, or copied into the error.
+        let raw = "raw-token-secret";
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key(raw);
+        let mut cred = Credential::new("tok", digest.clone());
+        cred.extra.insert("account_id".into(), "acct-123".into());
+        cred.extra.insert("cf_token_value".into(), raw.into());
+        let prov = Cloudflare::with_transport(FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok", "status": "expired", "value": raw })),
+        )]));
+
+        let err = prov.verify_key(&cred).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not active"), "{msg}");
+        assert!(msg.contains("expired"), "{msg}");
+        assert!(!msg.contains(raw), "token value leaked into the error: {msg}");
+        assert!(!msg.contains(&digest), "derived secret leaked into the error: {msg}");
+        assert!(!msg.contains("mgmt-token-value"), "{msg}");
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "GET");
+        assert!(req.url.ends_with("/accounts/acct-123/tokens/verify"), "{}", req.url);
+        assert_eq!(req.bearer.as_deref(), Some(raw));
+        assert_ne!(req.bearer.as_deref(), Some(digest.as_str()));
+        assert!(req.body.is_none());
+        assert!(!req.url.contains(raw) && !req.url.contains(&digest), "{}", req.url);
+    }
 }

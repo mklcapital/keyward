@@ -990,4 +990,35 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[test]
+    fn signing_keeps_a_non_default_port_and_changes_the_signature() {
+        // SigV4's canonical host includes a non-default port. Dropping :8443
+        // (or signing as if the URL path were part of the host) would make
+        // every request fail, or succeed against a different endpoint.
+        use chrono::TimeZone;
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let body = "Action=ListAccessKeys&Version=2010-05-08";
+        let sign = |endpoint: &str| {
+            sigv4::sign_query_post(endpoint, "iam", "us-east-1", "AKIDEXAMPLE", secret, None, body, now)
+                .unwrap()
+        };
+        let with_port = sign("https://iam.amazonaws.com:8443/ignored");
+        let bare = sign("https://iam.amazonaws.com/");
+        let host = with_port.iter().find(|(k, _)| k == "host").map(|(_, v)| v.as_str());
+        assert_eq!(host, Some("iam.amazonaws.com:8443"));
+        let auth = |headers: &[(String, String)]| {
+            headers.iter().find(|(k, _)| k == "authorization").unwrap().1.clone()
+        };
+        assert_ne!(auth(&with_port), auth(&bare), "the port must be part of the signature");
+        let sig = auth(&with_port).rsplit("Signature=").next().unwrap().to_string();
+        assert_eq!(sig.len(), 64);
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()), "{sig}");
+        for (_, value) in with_port.iter().chain(bare.iter()) {
+            assert!(!value.contains(secret), "signing secret leaked into a header: {value}");
+            assert!(!value.contains("ignored"), "URL path leaked into a header: {value}");
+            assert!(!value.contains("8443/ignored"), "{value}");
+        }
+    }
 }
