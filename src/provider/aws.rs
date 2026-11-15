@@ -990,4 +990,102 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn create_key_at_limit_with_two_inactive_deletes_only_the_older() {
+        // Two Inactive keys is still the 2-key cap, but it is not "2 ACTIVE".
+        // Refuse only when every key is live. The older inactive key is the
+        // one a previous rotation already parked; the newer one stays as the
+        // rollback anchor. Never delete both.
+        let secret = "brand-new-secret-once/only==";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIANEWER", "Inactive", "2026-06-01T00:00:00Z"),
+                    ("AKIAOLDER", "Inactive", "2026-01-01T00:00:00Z"),
+                ]),
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-name-must-not-be-a-field", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, one delete, create");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIAOLDER"), "{}", seen[1].body);
+        assert!(!seen[1].body.contains("AKIANEWER"), "newer inactive key must survive: {}", seen[1].body);
+        assert_eq!(seen.iter().filter(|r| r.body.contains("Action=DeleteAccessKey")).count(), 1);
+        assert!(seen[2].body.contains("Action=CreateAccessKey"));
+        assert!(!seen[2].body.contains("kw-name-must-not-be-a-field"));
+        for req in &seen {
+            assert!(!req.body.contains(secret), "{}", req.body);
+            assert!(!req.body.contains("wJalrXUtnFEMI/EXAMPLEKEY"), "{}", req.body);
+            assert!(!req.headers.iter().any(|(_, v)| v.contains(secret) || v.contains("wJalrXUtnFEMI/EXAMPLEKEY")));
+            assert_eq!(req.body.matches("Action=").count(), 1, "{}", req.body);
+            assert_eq!(req.body.matches("UserName=").count(), 1, "{}", req.body);
+        }
+    }
+
+    #[tokio::test]
+    async fn make_room_delete_http_300_does_not_mint_and_299_does() {
+        // The success check is `status >= 300`. 300 must not be treated as a
+        // deleted key (that would mint beside a key that is still there). 299
+        // is still success. A secret parked outside <Code>/<Message> must not
+        // be copied into the error.
+        let leaked = "LEAKED-DELETE-SECRET";
+        let minted = "minted-after-299-only==";
+        let listed = list_keys_xml(&[
+            ("AKIAACTIVE", "Active", "2026-06-01T00:00:00Z"),
+            ("AKIASTALE", "Inactive", "2026-01-01T00:00:00Z"),
+        ]);
+        let refused = format!(
+            "<ErrorResponse><Error><Code>AccessDenied</Code><Message>delete refused</Message>\
+             </Error><SecretAccessKey>{leaked}</SecretAccessKey></ErrorResponse>"
+        );
+
+        let blocked = FakeTransport::new(vec![
+            FakeTransport::ok(200, &listed),
+            FakeTransport::ok(300, &refused),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", minted)),
+        ]);
+        let prov = Aws::with_transport(blocked);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 300"), "{msg}");
+        assert!(msg.contains("AccessDenied: delete refused"), "{msg}");
+        assert!(!msg.contains(leaked), "{msg}");
+        assert!(!msg.contains(minted), "{msg}");
+        assert!(!msg.contains("wJalrXUtnFEMI/EXAMPLEKEY"), "{msg}");
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list and the failed delete; create must not run");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIASTALE"));
+        assert!(!seen[1].body.contains("AKIAACTIVE"));
+        assert!(!seen.iter().any(|r| r.body.contains("Action=CreateAccessKey")));
+
+        let allowed = FakeTransport::new(vec![
+            FakeTransport::ok(200, &listed),
+            FakeTransport::ok(299, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", minted)),
+        ]);
+        let prov = Aws::with_transport(allowed);
+        let cred = prov.create_key(&mgmt(), "kw", None).await.unwrap();
+        assert_eq!(cred.secret, minted);
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete 299, create");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[2].body.contains("Action=CreateAccessKey"));
+        for req in &seen {
+            assert!(!req.body.contains(minted), "{}", req.body);
+            assert!(!req.body.contains(leaked), "{}", req.body);
+            assert!(!req.body.contains("wJalrXUtnFEMI/EXAMPLEKEY"), "{}", req.body);
+            assert!(!req.headers.iter().any(|(_, v)| v.contains(minted) || v.contains(leaked)));
+        }
+    }
 }

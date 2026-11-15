@@ -312,6 +312,32 @@ mod tests {
     }
 
     #[test]
+    fn leading_space_on_recipient_and_trailing_space_on_identity_are_rejected() {
+        // A copied newline is already rejected. A leading or trailing space is
+        // the same class of accident: the key must not be silently trimmed
+        // into a different recipient, and the error must not echo the key.
+        let kp = KeyPair::generate();
+        let marker = b"PLAINTEXT-MARKER-spaced-recipient";
+        let recipient = format!(" {}", kp.recipient_str());
+        let err = Envelope::seal_to_recipient("t", &recipient, marker).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid age recipient"), "{msg}");
+        assert!(!msg.contains("PLAINTEXT-MARKER-spaced-recipient"), "{msg}");
+        assert!(!msg.contains(recipient.trim()), "{msg}");
+        assert!(!msg.contains(&recipient), "{msg}");
+
+        let identity = format!("{} ", kp.identity_str());
+        let err = match KeyPair::from_identity_str(&identity) {
+            Err(e) => e,
+            Ok(_) => panic!("a trailing space on an age identity was accepted"),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid age identity"), "{msg}");
+        assert!(!msg.contains(identity.trim()), "{msg}");
+        assert!(!msg.contains(&identity), "{msg}");
+    }
+
+    #[test]
     fn recreation_recipe_round_trips_as_json() {
         let kp = KeyPair::generate();
         let recipe = RecreationRecipe {

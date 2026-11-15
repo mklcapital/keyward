@@ -571,6 +571,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoke_accepts_399_and_rejects_400_without_echoing_the_token() {
+        // unwrap_result fails at HTTP >= 400. A 399 with success:true must
+        // still revoke, or the old token stays live while we report failure.
+        // A 400 with success:true must not report success. A token value
+        // smuggled in that error body must not be echoed.
+        let raw = "RAW-REVOKE-TOKEN";
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key(raw);
+
+        let ok = Cloudflare::with_transport(FakeTransport::new(vec![FakeTransport::ok(
+            399,
+            json!({"success": true, "errors": [], "result": null}),
+        )]));
+        ok.revoke_key(&mgmt(), "tok-old").await.unwrap();
+        let req = ok.transport.last();
+        assert_eq!(req.method, "DELETE");
+        assert_eq!(
+            req.url,
+            "https://api.cloudflare.com/client/v4/accounts/acct-123/tokens/tok-old"
+        );
+        assert_eq!(req.url.matches("tok-old").count(), 1);
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        assert!(req.body.is_none());
+        assert!(!req.url.contains(raw), "{}", req.url);
+
+        let bad = Cloudflare::with_transport(FakeTransport::new(vec![FakeTransport::ok(
+            400,
+            json!({
+                "success": true,
+                "errors": [{"code": 1000, "message": "invalid token"}],
+                "result": {"id": "tok-old", "value": raw}
+            }),
+        )]));
+        let err = bad.revoke_key(&mgmt(), "tok-old").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 400"), "{msg}");
+        assert!(msg.contains("[1000] invalid token"), "{msg}");
+        assert!(!msg.contains(raw), "{msg}");
+        assert!(!msg.contains(&digest), "{msg}");
+        assert!(!msg.contains("mgmt-token-value"), "{msg}");
+        assert!(!msg.contains("tok-old"), "{msg}");
+        let req = bad.transport.last();
+        assert_eq!(req.method, "DELETE");
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        assert!(!req.url.contains(raw), "{}", req.url);
+        assert!(!req.url.contains(&digest), "{}", req.url);
+    }
+
+    #[tokio::test]
     async fn transport_failure_propagates() {
         let fake = FakeTransport::new(vec![Err("connection reset".into())]);
         let prov = Cloudflare::with_transport(fake);
