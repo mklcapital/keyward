@@ -990,4 +990,38 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn list_keys_does_not_surface_a_secret_element() {
+        // ListAccessKeys is metadata only. A SecretAccessKey element in the
+        // response must not become a capability, a name, or part of the request.
+        let xml = "\
+<ListAccessKeysResponse><ListAccessKeysResult><AccessKeyMetadata>\
+<member><UserName>admin</UserName><AccessKeyId>AKIAPUB</AccessKeyId>\
+<Status>Active</Status><SecretAccessKey>LEAKED-LIST-SECRET-VALUE</SecretAccessKey>\
+<CreateDate>2026-01-01T00:00:00Z</CreateDate></member>\
+</AccessKeyMetadata></ListAccessKeysResult></ListAccessKeysResponse>";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, xml)]);
+        let prov = Aws::with_transport(fake);
+        let keys = prov.list_keys(&mgmt()).await.unwrap();
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_id, "AKIAPUB");
+        assert_eq!(keys[0].name.as_deref(), Some("svc-backups"));
+        assert_eq!(keys[0].capabilities, vec!["status:Active".to_string()]);
+        assert!(keys[0].bucket_id.is_none());
+        let rendered = format!("{keys:?}");
+        assert!(!rendered.contains("LEAKED-LIST-SECRET-VALUE"), "{rendered}");
+        assert!(!rendered.contains("admin"), "{rendered}");
+
+        let req = prov.transport.last();
+        assert_eq!(req.body.matches("Action=").count(), 1);
+        assert!(req.body.contains("Action=ListAccessKeys"));
+        assert!(req.body.contains("UserName=svc-backups"));
+        assert!(!req.body.contains("LEAKED-LIST-SECRET-VALUE"));
+        assert!(!req.body.contains("wJalrXUtnFEMI/EXAMPLEKEY"));
+        assert!(req.headers.iter().all(|(_, v)| {
+            !v.contains("LEAKED-LIST-SECRET-VALUE") && !v.contains("wJalrXUtnFEMI/EXAMPLEKEY")
+        }));
+    }
 }
