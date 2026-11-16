@@ -577,4 +577,36 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_key_http_399_without_success_does_not_mint() {
+        // Below 400 the success flag still decides. A token value in `result`
+        // must not be minted or copied into the error.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            399,
+            json!({
+                "success": false,
+                "errors": [{ "code": 1000, "message": "nope" }],
+                "result": { "id": "tok-new", "value": "RAW-399-TOKEN" }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[1000] nope"), "{msg}");
+        assert!(!msg.contains("HTTP 399"), "{msg}");
+        assert!(!msg.contains("RAW-399-TOKEN"), "{msg}");
+        assert!(!msg.contains("tok-new"), "{msg}");
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key("RAW-399-TOKEN");
+        assert!(!msg.contains(&digest), "{msg}");
+        assert!(!msg.contains("mgmt-token-value"), "{msg}");
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.unwrap().to_string();
+        assert!(!body.contains("RAW-399-TOKEN"));
+        assert!(!body.contains(&digest));
+        assert!(!body.contains("tok-new"));
+    }
 }

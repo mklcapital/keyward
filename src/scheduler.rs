@@ -428,4 +428,47 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn next_run_keeps_the_base_subsecond() {
+        use chrono::TimeZone;
+        let base = Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap()
+            + chrono::Duration::nanoseconds(123_456_789);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let next = next_run_from(base, &sched("2500ms", "0s"), &mut rng);
+        // 2.5s added to .123456789s is .623456789s. Truncating the base, or
+        // the sum, would land on .500000000 or .000000000 instead.
+        assert_eq!(next, base + chrono::Duration::milliseconds(2500));
+        assert_eq!(next.timestamp_subsec_nanos(), 623_456_789);
+        assert_eq!(
+            next.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            "2026-07-07T12:00:02.623456789Z"
+        );
+    }
+
+    #[test]
+    fn corrupt_last_run_does_not_replace_a_valid_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let raw = r#"{"next_run":{"prod":"2026-07-07T12:00:00Z"},"last_run":{"prod":"tomorrow"}}"#;
+        std::fs::write(&path, raw).unwrap();
+
+        let err = State::load(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parsing state"), "{msg}");
+        assert!(!msg.contains("2026-07-07T12:00:00Z"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+
+        let good = r#"{"next_run":{"prod":"2026-07-07T12:00:00Z"},"last_run":{"prod":"2026-07-01T00:00:00Z"}}"#;
+        std::fs::write(&path, good).unwrap();
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(
+            loaded.next_run["prod"].to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "2026-07-07T12:00:00Z"
+        );
+        assert_eq!(
+            loaded.last_run["prod"].to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "2026-07-01T00:00:00Z"
+        );
+    }
 }
