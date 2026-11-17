@@ -117,3 +117,72 @@ pub async fn rotate(t: &Target, store: &dyn SecretStore, opts: &Options) -> Resu
         sealed_recipe,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target() -> Target {
+        Target {
+            name: "b2-prod".into(),
+            provider: "B2".into(),
+            vault: "Vault".into(),
+            item: "item".into(),
+            field_key_id: "keyID".into(),
+            field_secret: "applicationKey".into(),
+            management_item: "mgmt-ADMIN-ITEM".into(),
+            mgmt_field_key_id: "keyID".into(),
+            mgmt_field_secret: "applicationKey".into(),
+            key_name_prefix: "kw".into(),
+            schedule: None,
+            recipe_recipient: Some("age1SECRET-RECIPIENT-DO-NOT-COPY".into()),
+            console_url: Some("https://console.example/keys?user=svc".into()),
+        }
+    }
+
+    #[test]
+    fn bucket_id_zero_and_blank_stay_restrictions() {
+        // A discovered bucket id of "0" or "" is still a restriction. Dropping
+        // either one would record an account-wide recipe. The console URL is
+        // not scope, and a blank capability is not invented into listBuckets.
+        let t = target();
+        let zero = KeyInfo {
+            key_id: "key-0".into(),
+            name: Some("old".into()),
+            capabilities: vec!["readFiles".into(), String::new(), "readFiles".into()],
+            bucket_id: Some("0".into()),
+        };
+        let recipe = build_recipe(&t, Some(&zero));
+        assert_eq!(recipe.provider, "B2");
+        assert_eq!(
+            recipe.console_url.as_deref(),
+            Some("https://console.example/keys?user=svc")
+        );
+        assert_eq!(recipe.login_reference.as_deref(), Some("op://Vault/item"));
+        assert_eq!(
+            recipe.capabilities,
+            vec!["readFiles".to_string(), String::new(), "readFiles".to_string()]
+        );
+        assert_eq!(recipe.resource_restrictions, vec!["bucketId:0".to_string()]);
+        assert!(recipe.notes.is_none());
+        assert!(!recipe.resource_restrictions.iter().any(|r| r.contains("console.example")));
+
+        let blank = KeyInfo {
+            key_id: "key-blank".into(),
+            name: None,
+            capabilities: vec![],
+            bucket_id: Some(String::new()),
+        };
+        let blank_recipe = build_recipe(&t, Some(&blank));
+        assert_eq!(blank_recipe.resource_restrictions, vec!["bucketId:".to_string()]);
+        assert!(blank_recipe.capabilities.is_empty());
+
+        let json = serde_json::to_string(&recipe).unwrap();
+        assert!(!json.contains("mgmt-ADMIN-ITEM"));
+        assert!(!json.contains("age1SECRET"));
+        assert!(!json.contains("listBuckets"));
+        assert!(!json.contains("listFiles"));
+        assert!(json.contains("bucketId:0"));
+        assert!(json.contains("console.example"));
+    }
+}
