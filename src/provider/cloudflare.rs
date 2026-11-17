@@ -444,6 +444,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scalar_policy_array_is_copied_not_widened() {
+        // A non-empty JSON array is a discovered policy even when its elements
+        // are not objects. Replacing it with the account-wide read fallback
+        // would mint a broader token than the one we found.
+        let raw = "RAW-SCALAR-POLICY-TOKEN";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({
+                "id": "tok-new",
+                "value": raw,
+                "name": "FROM-RESPONSE",
+            })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let like = KeyInfo {
+            key_id: "tok-old".into(),
+            name: Some("old".into()),
+            capabilities: vec!["[1, 2]".into()],
+            bucket_id: None,
+        };
+
+        let cred = prov.create_key(&mgmt(), "kw-scalar", Some(&like)).await.unwrap();
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key(raw);
+        assert_eq!(cred.key_id, "tok-new");
+        assert_eq!(cred.secret, digest);
+        assert_eq!(cred.extra.get("policies").map(String::as_str), Some("[1,2]"));
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert!(req.url.ends_with("/accounts/acct-123/tokens"), "got: {}", req.url);
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.unwrap();
+        assert_eq!(body["name"], "kw-scalar");
+        assert_eq!(body["policies"], json!([1, 2]));
+        let rendered = format!("{body}");
+        assert!(!rendered.contains("6a018a9f2fc74eb6b293b0c548f38b39"));
+        assert!(!rendered.contains("com.cloudflare.edge.r2.bucket.*"));
+        assert!(!rendered.contains("acct-123"));
+        assert!(!rendered.contains(raw));
+        assert!(!rendered.contains(&digest));
+        assert!(!rendered.contains("mgmt-token-value"));
+        assert!(!rendered.contains("FROM-RESPONSE"));
+        assert!(!req.url.contains(raw));
+        assert!(!req.url.contains(&digest));
+    }
+
+    #[tokio::test]
     async fn create_key_falls_back_to_read_only_policy() {
         let fake = FakeTransport::new(vec![FakeTransport::ok(
             200,
