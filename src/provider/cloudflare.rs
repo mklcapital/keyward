@@ -577,4 +577,52 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn copied_policy_array_keeps_every_object() {
+        // Scope is the whole policies array, not only its first object.
+        // Dropping the second object would mint a narrower key than the one
+        // being replaced. The read-only fallback must not replace either.
+        let policies = json!([
+            { "effect": "allow", "permission_groups": [{ "id": "pg-read" }] },
+            { "effect": "allow", "permission_groups": [{ "id": "pg-write" }] }
+        ]);
+        let like = KeyInfo {
+            key_id: "tok-old".into(),
+            name: Some("old".into()),
+            capabilities: vec![policies.to_string()],
+            bucket_id: None,
+        };
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({
+                "id": "tok-new",
+                "value": "RAW-ARRAY-TOKEN",
+                "name": "FROM-RESPONSE",
+            })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-two", Some(&like)).await.unwrap();
+        assert_eq!(cred.key_id, "tok-new");
+        assert_eq!(
+            cred.secret,
+            Cloudflare::<ReqwestTransport>::derive_secret_access_key("RAW-ARRAY-TOKEN")
+        );
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.unwrap();
+        assert_eq!(body["name"], "kw-two");
+        assert_eq!(body["policies"], policies);
+        assert_eq!(body["policies"].as_array().unwrap().len(), 2);
+        let rendered = body.to_string();
+        assert!(!rendered.contains("6a018a9f2fc74eb6b293b0c548f38b39"));
+        assert!(!rendered.contains("RAW-ARRAY-TOKEN"));
+        assert!(!rendered.contains("mgmt-token-value"));
+        assert!(!rendered.contains("FROM-RESPONSE"));
+        assert!(!rendered.contains(&cred.secret));
+        assert!(!req.url.contains("RAW-ARRAY-TOKEN"));
+        assert!(!req.url.contains("mgmt-token-value"));
+    }
 }

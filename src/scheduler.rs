@@ -428,4 +428,25 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn format_plan_two_day_line_uses_utc_offset() {
+        // Two days out is a day bucket, not an hour count, and the timestamp
+        // stays in UTC. A local offset would move the displayed deadline.
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let plan = vec![PlanEntry {
+            target: "alpha".into(),
+            next_run: now + chrono::Duration::days(2),
+            freshly_scheduled: false,
+        }];
+        let text = format_plan(&plan, now);
+        assert_eq!(
+            text,
+            "alpha                next 2026-07-09T12:00:00+00:00 (in 2d0h) [persisted]\n"
+        );
+        assert!(!text.contains('Z'));
+        assert!(!text.contains("in 48h"));
+        assert!(!text.contains("in 2d2h"));
+    }
 }
