@@ -990,4 +990,43 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn make_room_keeps_an_older_active_key() {
+        // The live key is the oldest key on the account. Date order alone
+        // would delete it. Only the oldest inactive key may be removed.
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIAACTIVE", "Active", "2019-01-01T00:00:00Z"),
+                    ("AKIANEWER", "Inactive", "2026-06-01T00:00:00Z"),
+                    ("AKIAOLDER", "Inactive", "2024-01-01T00:00:00Z"),
+                ]),
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", "brand-new-secret-once/only==")),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-ignored", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, "brand-new-secret-once/only==");
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, one delete, create");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIAOLDER"));
+        assert!(!seen[1].body.contains("AKIAACTIVE"));
+        assert!(!seen[1].body.contains("AKIANEWER"));
+        assert_eq!(seen.iter().filter(|r| r.body.contains("Action=DeleteAccessKey")).count(), 1);
+        assert!(seen[2].body.contains("Action=CreateAccessKey"));
+        assert!(!seen[2].body.contains("kw-ignored"), "the requested name is not an IAM field");
+        for req in &seen {
+            assert_eq!(req.body.matches("UserName=").count(), 1, "{}", req.body);
+            assert!(!req.body.contains("wJalrXUtnFEMI"), "signing secret in {}", req.body);
+            assert!(!req.body.contains("brand-new-secret"), "new secret in {}", req.body);
+            assert!(!req.headers.iter().any(|(_, v)| v.contains("wJalrXUtnFEMI") || v.contains("brand-new-secret")));
+        }
+    }
 }
