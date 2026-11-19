@@ -428,4 +428,43 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn removed_target_keeps_its_slot_until_it_returns() {
+        // A target that leaves the config must keep the persisted instant.
+        // Coming back reuses that slot, so a restart cannot re-roll jitter.
+        // A sibling that was never scheduled still gets a fresh one.
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let kept = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let mut state = State::default();
+        state.next_run.insert("alpha".into(), kept);
+        state.next_run.insert("gone".into(), kept);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+
+        let cfg = cfg_with(vec![
+            ("alpha", Some(sched("30d", "10d"))),
+            ("beta", Some(sched("1d", "0s"))),
+        ]);
+        let first = plan(&cfg, &mut state, now, &mut rng);
+        assert_eq!(state.next_run.get("gone").copied(), Some(kept));
+        assert_eq!(state.next_run.get("alpha").copied(), Some(kept));
+        assert!(first.iter().all(|p| p.target != "gone"));
+        let alpha = first.iter().find(|p| p.target == "alpha").unwrap();
+        assert_eq!(alpha.next_run, kept);
+        assert!(!alpha.freshly_scheduled);
+        let beta = first.iter().find(|p| p.target == "beta").unwrap();
+        assert!(beta.freshly_scheduled);
+        let beta_next = beta.next_run;
+        assert_eq!(beta_next, now + chrono::Duration::days(1));
+
+        let cfg = cfg_with(vec![("gone", Some(sched("30d", "10d")))]);
+        let second = plan(&cfg, &mut state, now, &mut rng);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].target, "gone");
+        assert_eq!(second[0].next_run, kept);
+        assert!(!second[0].freshly_scheduled);
+        assert_eq!(state.next_run.get("alpha").copied(), Some(kept));
+        assert_eq!(state.next_run.get("beta").copied(), Some(beta_next));
+    }
 }
