@@ -990,4 +990,58 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn list_keys_percent_encodes_a_space_in_the_iam_user() {
+        // AWS form bodies encode a space as %20. A plus would be a different
+        // user, and the signature must be over the encoded body that is sent.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")]),
+        )]);
+        let prov = Aws::with_transport(fake);
+        let mut cred = mgmt();
+        cred.extra.insert("iam_user".into(), "svc backups".into());
+
+        let keys = prov.list_keys(&cred).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_id, "AKIAOLD");
+        assert_eq!(keys[0].name.as_deref(), Some("svc backups"));
+
+        let req = prov.transport.last();
+        let secret = "wJalrXUtnFEMI/EXAMPLEKEY";
+        let body = "Action=ListAccessKeys&UserName=svc%20backups&Version=2010-05-08";
+        assert_eq!(req.body, body);
+        assert!(!req.body.contains('+'), "space must not be encoded as plus: {}", req.body);
+        assert!(!req.body.contains(' '), "space must not be left raw: {}", req.body);
+        assert_eq!(req.body.matches("Action=").count(), 1);
+        assert_eq!(req.body.matches("UserName=").count(), 1);
+        assert!(!req.body.contains(secret));
+        assert!(!req.headers.iter().any(|(_, v)| v.contains(secret)));
+
+        let expected = sigv4::sign_query_post(
+            IAM_ENDPOINT,
+            "iam",
+            AWS_REGION,
+            "AKIAEXAMPLEMGMT",
+            secret,
+            None,
+            body,
+            prov.now(),
+        )
+        .unwrap();
+        assert_eq!(req.headers, expected);
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "x-amz-date").unwrap().1,
+            "20260707T120000Z"
+        );
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "content-type").unwrap().1,
+            "application/x-www-form-urlencoded; charset=utf-8"
+        );
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "host").unwrap().1,
+            "iam.amazonaws.com"
+        );
+    }
 }

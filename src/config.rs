@@ -73,3 +73,65 @@ pub fn load(path: &str) -> Result<Config> {
     let s = std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
     toml::from_str(&s).context("parsing config TOML")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> Result<Config> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyward.toml");
+        std::fs::write(&path, src).unwrap();
+        load(path.to_str().unwrap())
+    }
+
+    #[test]
+    fn duplicate_target_names_stay_distinct_rows() {
+        // `[[target]]` is a list, not a map. Two rows can share a name and still
+        // rotate different items. Collapsing them at load would drop one credential.
+        let cfg = parse(
+            r#"
+            [[target]]
+            name = "shared"
+            provider = "aws"
+            vault = "Work"
+            item = "svc-aws"
+            management_item = "mgmt-aws"
+
+            [target.schedule]
+            interval = "1d"
+
+            [[target]]
+            name = "shared"
+            provider = "b2"
+            vault = "Personal"
+            item = "svc-b2"
+            management_item = "mgmt-b2"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.target.len(), 2);
+        let first = &cfg.target[0];
+        let second = &cfg.target[1];
+        assert_eq!(first.name, "shared");
+        assert_eq!(second.name, "shared");
+        assert_eq!(first.provider, "aws");
+        assert_eq!(second.provider, "b2");
+        assert_eq!(first.vault, "Work");
+        assert_eq!(second.vault, "Personal");
+        assert_eq!(first.item, "svc-aws");
+        assert_eq!(second.item, "svc-b2");
+        assert_eq!(first.management_item, "mgmt-aws");
+        assert_eq!(second.management_item, "mgmt-b2");
+        assert_ne!(first.item, second.item);
+        assert_ne!(first.management_item, second.management_item);
+
+        let schedule = first.schedule.as_ref().unwrap();
+        assert_eq!(schedule.interval, std::time::Duration::from_secs(24 * 3600));
+        assert_eq!(schedule.jitter, std::time::Duration::ZERO);
+        assert!(second.schedule.is_none());
+        assert!(first.recipe_recipient.is_none());
+        assert!(second.console_url.is_none());
+    }
+}
