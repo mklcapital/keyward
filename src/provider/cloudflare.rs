@@ -577,4 +577,35 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_string_result_does_not_mint() {
+        // `result` must be an object with string `id` and `value`. A bare
+        // string is not a token, even when `success` is true. The string, its
+        // derived secret, and the management token stay out of the error.
+        let leaked = "RAW-STRING-RESULT-TOKEN";
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key(leaked);
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({ "success": true, "errors": [], "result": leaked }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw-string", None).await.unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("no `id`"), "{chain}");
+        assert!(!chain.contains(leaked), "{chain}");
+        assert!(!chain.contains(&digest), "{chain}");
+        assert!(!chain.contains("mgmt-token-value"), "{chain}");
+
+        let seen = prov.transport.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(seen[0].bearer.as_deref(), Some("mgmt-token-value"));
+        let body = seen[0].body.as_ref().unwrap().to_string();
+        assert!(!body.contains(leaked), "{body}");
+        assert!(!body.contains(&digest), "{body}");
+        assert!(!body.contains("mgmt-token-value"), "{body}");
+        assert!(!seen[0].url.contains(leaked));
+        assert!(seen[0].url.contains("/accounts/acct-123/tokens"), "{}", seen[0].url);
+    }
 }
