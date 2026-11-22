@@ -428,4 +428,34 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn null_last_run_fails_to_load_and_stays_on_disk() {
+        // `#[serde(default)]` applies only when the field is missing. An
+        // explicit null must not load as an empty map and wipe the audit trail.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let raw = "{\"next_run\":{\"alpha\":\"2026-07-07T12:00:00Z\"},\"last_run\":null}";
+        std::fs::write(&path, raw).unwrap();
+        let err = State::load(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parsing state"), "{msg}");
+        assert!(!msg.contains("2026-08-01"), "{msg}");
+        assert_eq!(std::fs::read(&path).unwrap(), raw.as_bytes());
+
+        // A later valid file still loads. The rejected null did not stick.
+        let good = "{\"next_run\":{\"alpha\":\"2026-08-01T00:00:00Z\"},\"last_run\":{\"alpha\":\"2026-07-07T12:00:00Z\"}}";
+        std::fs::write(&path, good).unwrap();
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded.next_run.len(), 1);
+        assert_eq!(loaded.last_run.len(), 1);
+        assert_eq!(
+            loaded.next_run["alpha"].to_rfc3339(),
+            "2026-08-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            loaded.last_run["alpha"].to_rfc3339(),
+            "2026-07-07T12:00:00+00:00"
+        );
+    }
 }

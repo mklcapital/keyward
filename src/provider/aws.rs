@@ -990,4 +990,79 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[test]
+    fn self_closing_and_unclosed_key_tags_do_not_mint() {
+        // `<AccessKeyId>` is not a prefix of `<AccessKeyId/>` or `<AccessKeyId />`.
+        // A self-closing tag must not become a key, and a secret beside it must
+        // not be returned as a credential. An unclosed id must not be invented.
+        let leaked = "LEAKED-SELF-CLOSE-SECRET";
+        let listed = format!(
+            "<ListAccessKeysResult>\
+             <member><AccessKeyId>AKIAGOOD</AccessKeyId><Status>Active</Status>\
+             <CreateDate>2026-01-01T00:00:00Z</CreateDate></member>\
+             <member><AccessKeyId/><Status>Inactive</Status>\
+             <SecretAccessKey>{leaked}</SecretAccessKey></member>\
+             <member><AccessKeyId />{leaked}</member>\
+             <member><AccessKeyId>AKIASECOND</AccessKeyId><Status>Inactive</Status>\
+             <CreateDate>2026-02-01T00:00:00Z</CreateDate></member>\
+             </ListAccessKeysResult>"
+        );
+        let keys = xml::parse_access_key_metadata(&listed);
+        assert_eq!(keys.len(), 2, "self-closing tags are not keys: {keys:?}");
+        assert_eq!(keys[0].access_key_id, "AKIAGOOD");
+        assert_eq!(keys[0].status, "Active");
+        assert_eq!(keys[0].create_date, "2026-01-01T00:00:00Z");
+        assert_eq!(keys[1].access_key_id, "AKIASECOND");
+        assert_eq!(keys[1].status, "Inactive");
+        assert!(keys.iter().all(|k| !k.access_key_id.contains(leaked)));
+        assert!(keys.iter().all(|k| k.status != leaked));
+
+        assert!(xml::parse_created_access_key(&format!(
+            "<AccessKeyId/><SecretAccessKey>{leaked}</SecretAccessKey>"
+        ))
+        .is_none());
+        assert!(xml::parse_created_access_key(&format!(
+            "<AccessKeyId /><SecretAccessKey>{leaked}</SecretAccessKey>"
+        ))
+        .is_none());
+        let unclosed = format!("<AccessKeyId>AKIABROKEN<SecretAccessKey>{leaked}</SecretAccessKey>");
+        assert!(xml::parse_access_key_metadata(&unclosed).is_empty());
+        assert!(xml::parse_created_access_key(&unclosed).is_none());
+    }
+
+    #[tokio::test]
+    async fn create_http_200_error_document_does_not_mint() {
+        // IAM can return HTTP 200 with an <Error> body. That is not a key.
+        // The message must not be echoed: it is the only place a confused
+        // parser would pick up a secret, and the error string does not include
+        // the response body.
+        let leaked = "LEAKED-200-MESSAGE-SECRET";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[("AKIAOLD", "Active", "2026-01-01T00:00:00Z")])),
+            FakeTransport::ok(200, &error_xml("InvalidClientTokenId", leaked)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw-not-a-form-field", None).await.unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("missing AccessKeyId") || chain.contains("SecretAccessKey"),
+            "{chain}"
+        );
+        assert!(!chain.contains(leaked), "{chain}");
+        assert!(!chain.contains("wJalrXUtnFEMI/EXAMPLEKEY"), "{chain}");
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2, "list then the failed create; no delete");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=CreateAccessKey"));
+        assert!(!seen.iter().any(|r| r.body.contains("Action=DeleteAccessKey")));
+        assert!(!seen.iter().any(|r| r.body.contains(leaked)));
+        assert!(!seen.iter().any(|r| r.body.contains("wJalrXUtnFEMI/EXAMPLEKEY")));
+        assert!(!seen.iter().any(|r| r.headers.iter().any(|(_, v)| v.contains(leaked))));
+        assert_eq!(
+            seen.iter().filter(|r| r.body.contains("UserName=svc-backups")).count(),
+            2
+        );
+    }
 }
