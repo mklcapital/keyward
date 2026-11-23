@@ -73,3 +73,66 @@ pub fn load(path: &str) -> Result<Config> {
     let s = std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
     toml::from_str(&s).context("parsing config TOML")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn compound_schedule_parses_and_provider_case_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyward.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[target]]
+name = "alpha"
+provider = "aws"
+vault = "Personal"
+item = "svc"
+management_item = "mgmt"
+schedule = { interval = "1h30m30s", jitter = "500ms" }
+
+[[target]]
+name = "beta"
+provider = "b2"
+vault = "Personal"
+item = "other"
+management_item = "mgmt"
+"#,
+        )
+        .unwrap();
+
+        let cfg = load(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.target.len(), 2);
+        assert_eq!(cfg.target[0].name, "alpha");
+        assert_eq!(cfg.target[0].provider, "aws");
+        let sched = cfg.target[0].schedule.as_ref().unwrap();
+        assert_eq!(sched.interval, Duration::from_secs(5430));
+        assert_eq!(sched.jitter, Duration::from_millis(500));
+        assert_eq!(cfg.target[1].name, "beta");
+        assert_eq!(cfg.target[1].provider, "b2");
+        assert!(cfg.target[1].schedule.is_none());
+    }
+
+    #[test]
+    fn unknown_interval_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyward.toml");
+        let raw = r#"
+[[target]]
+name = "alpha"
+provider = "aws"
+vault = "Personal"
+item = "svc"
+management_item = "mgmt"
+schedule = { interval = "tomorrow", jitter = "0s" }
+"#;
+        std::fs::write(&path, raw).unwrap();
+        let err = load(path.to_str().unwrap()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parsing config"), "got: {msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+    }
+}

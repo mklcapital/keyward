@@ -990,4 +990,87 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    /// IAM `CreateDate` is ordered as text. A fractional timestamp sorts before the
+    /// same whole second (`'.' < 'Z'`), so make-room must delete that key even
+    /// when it is listed later — and must not touch the Active key that is older
+    /// in real time.
+    #[tokio::test]
+    async fn fractional_create_date_is_the_make_room_victim() {
+        let secret = "FRAC-SECRET-ONCE/only==";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(
+                200,
+                &list_keys_xml(&[
+                    ("AKIAACTIVE", "Active", "2019-01-01T00:00:00Z"),
+                    ("AKIAWHOLE", "Inactive", "2020-01-02T00:00:00Z"),
+                    ("AKIAFRAC", "Inactive", "2020-01-02T00:00:00.000Z"),
+                ]),
+            ),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-name-not-a-field", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete, create");
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIAFRAC"), "got: {}", seen[1].body);
+        assert!(!seen[1].body.contains("AKIAWHOLE"), "whole-second key is not the string-sort victim");
+        assert!(!seen[1].body.contains("AKIAACTIVE"), "must never delete the Active key");
+        assert_eq!(seen.iter().filter(|r| r.body.contains("Action=DeleteAccessKey")).count(), 1);
+        assert!(seen[2].body.contains("Action=CreateAccessKey"));
+        assert!(!seen.iter().any(|r| r.body.contains("kw-name-not-a-field")));
+        for req in &seen {
+            assert!(!req.body.contains(secret), "minted secret leaked into {}", req.body);
+            assert!(!req.body.contains("wJalrXUtnFEMI"));
+            assert!(!req.headers.iter().any(|(_, v)| v.contains(secret) || v.contains("wJalrXUtnFEMI")));
+        }
+    }
+
+    /// A slash in the IAM user is one form field, encoded once. It must not stay
+    /// raw (that would split the field) and must not be encoded twice.
+    #[tokio::test]
+    async fn iam_user_slash_is_encoded_once() {
+        use chrono::TimeZone;
+        let mut cred = mgmt();
+        cred.extra.insert("iam_user".into(), "svc/root".into());
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let keys = prov.list_keys(&cred).await.unwrap();
+        assert!(keys.is_empty());
+
+        let req = prov.transport.last();
+        assert_eq!(req.url, IAM_ENDPOINT);
+        assert_eq!(
+            req.body,
+            "Action=ListAccessKeys&UserName=svc%2Froot&Version=2010-05-08"
+        );
+        assert_eq!(req.body.matches("Action=").count(), 1);
+        assert_eq!(req.body.matches("UserName=").count(), 1);
+        assert!(!req.body.contains("svc/root"));
+        assert!(!req.body.contains("%252F"));
+        let expected = sigv4::sign_query_post(
+            IAM_ENDPOINT,
+            "iam",
+            AWS_REGION,
+            "AKIAEXAMPLEMGMT",
+            "wJalrXUtnFEMI/EXAMPLEKEY",
+            None,
+            &req.body,
+            chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let auth = req.headers.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        let expected_auth = expected.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        assert_eq!(auth, expected_auth);
+        assert!(req.headers.iter().any(|(k, v)| k == "host" && v == "iam.amazonaws.com"));
+        assert!(req.headers.iter().any(|(k, v)| k == "x-amz-date" && v == "20260707T120000Z"));
+        assert!(!req.headers.iter().any(|(_, v)| v.contains("wJalrXUtnFEMI")));
+        assert!(!req.body.contains("wJalrXUtnFEMI"));
+    }
 }

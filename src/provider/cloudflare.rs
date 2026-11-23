@@ -577,4 +577,38 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    /// The management token is sent exactly as stored. A trailing space is part
+    /// of the credential, not whitespace to trim.
+    #[tokio::test]
+    async fn management_token_trailing_space_is_the_bearer() {
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": "raw-token-secret", "name": "FROM-RESPONSE" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = prov
+            .create_key(&Credential::new("acct-123", "mgmt-token-value "), "kw-spaced", None)
+            .await
+            .unwrap();
+        assert_eq!(cred.key_id, "tok-new");
+        assert_eq!(
+            cred.secret,
+            Cloudflare::<ReqwestTransport>::derive_secret_access_key("raw-token-secret")
+        );
+        assert_ne!(
+            cred.secret,
+            Cloudflare::<ReqwestTransport>::derive_secret_access_key("mgmt-token-value ")
+        );
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.url, format!("{API_BASE}/accounts/acct-123/tokens"));
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value "));
+        let body = req.body.unwrap().to_string();
+        assert!(!body.contains("mgmt-token-value"));
+        assert!(!body.contains("raw-token-secret"));
+        assert!(!body.contains("FROM-RESPONSE"));
+        assert!(!req.url.contains(' '));
+    }
 }
