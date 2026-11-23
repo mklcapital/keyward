@@ -117,3 +117,53 @@ pub async fn rotate(t: &Target, store: &dyn SecretStore, opts: &Options) -> Resu
         sealed_recipe,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target() -> Target {
+        Target {
+            name: "svc".into(),
+            provider: "b2".into(),
+            vault: "Team/Ops".into(),
+            item: "svc/key".into(),
+            field_key_id: "keyID".into(),
+            field_secret: "DO-NOT-COPY-FIELD".into(),
+            management_item: "mgmt-ADMIN-ITEM".into(),
+            mgmt_field_key_id: "keyID".into(),
+            mgmt_field_secret: "applicationKey".into(),
+            key_name_prefix: "kw".into(),
+            schedule: None,
+            recipe_recipient: Some("age1SECRET-RECIPIENT-DO-NOT-COPY".into()),
+            console_url: Some("https://secure.backblaze.com/app?bucket=a&b=1".into()),
+        }
+    }
+
+    /// The 1Password reference is the vault and item joined as written. Slashes
+    /// are not encoded, and a console query string stays one URL.
+    #[test]
+    fn recipe_login_reference_keeps_slashes_and_query() {
+        let recipe = build_recipe(&target(), None);
+        assert_eq!(recipe.provider, "b2");
+        assert_eq!(recipe.login_reference.as_deref(), Some("op://Team/Ops/svc/key"));
+        assert_eq!(
+            recipe.console_url.as_deref(),
+            Some("https://secure.backblaze.com/app?bucket=a&b=1")
+        );
+        assert!(recipe.capabilities.is_empty());
+        assert!(recipe.resource_restrictions.is_empty());
+        assert!(recipe.notes.is_none());
+
+        let json = serde_json::to_string(&recipe).unwrap();
+        let back: RecreationRecipe = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, recipe);
+        assert!(json.contains("op://Team/Ops/svc/key"));
+        assert!(json.contains("https://secure.backblaze.com/app?bucket=a&b=1"));
+        assert!(!json.contains("age1SECRET-RECIPIENT-DO-NOT-COPY"));
+        assert!(!json.contains("mgmt-ADMIN-ITEM"));
+        assert!(!json.contains("DO-NOT-COPY-FIELD"));
+        assert!(!json.contains("listBuckets"));
+        assert!(!json.contains("bucketId"));
+    }
+}
