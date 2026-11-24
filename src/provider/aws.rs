@@ -990,4 +990,94 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    /// The first `<Status>` after an id is the one that decides Active vs
+    /// deletable. A later `<Status>Inactive</Status>` in the same member must
+    /// not make an Active key the make-room victim.
+    #[tokio::test]
+    async fn first_status_tag_keeps_an_active_key() {
+        let secret = "FIRST-STATUS-SECRET-ONCE/only==";
+        let xml = "\
+<ListAccessKeysResponse><ListAccessKeysResult><AccessKeyMetadata>\
+<member><AccessKeyId>AKIAACTIVE</AccessKeyId>\
+<Status>Active</Status><Status>Inactive</Status>\
+<CreateDate>2019-01-01T00:00:00Z</CreateDate></member>\
+<member><AccessKeyId>AKIASTALE</AccessKeyId>\
+<Status>Inactive</Status><CreateDate>2026-06-01T00:00:00Z</CreateDate></member>\
+</AccessKeyMetadata></ListAccessKeysResult></ListAccessKeysResponse>";
+
+        let listed = Aws::with_transport(FakeTransport::new(vec![FakeTransport::ok(200, xml)]));
+        let keys = listed.list_keys(&mgmt()).await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key_id, "AKIAACTIVE");
+        assert_eq!(keys[0].capabilities, vec!["status:Active".to_string()]);
+        assert_eq!(keys[1].key_id, "AKIASTALE");
+        assert_eq!(keys[1].capabilities, vec!["status:Inactive".to_string()]);
+        assert!(!keys.iter().any(|k| k.capabilities.iter().any(|c| c == "status:Inactive") && k.key_id == "AKIAACTIVE"));
+
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, xml),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-name-not-a-field", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, delete, create");
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIASTALE"), "got: {}", seen[1].body);
+        assert!(!seen[1].body.contains("AKIAACTIVE"), "a later Inactive tag must not delete the Active key");
+        assert_eq!(seen.iter().filter(|r| r.body.contains("Action=DeleteAccessKey")).count(), 1);
+        assert!(!seen.iter().any(|r| r.body.contains("kw-name-not-a-field")));
+        for req in &seen {
+            assert!(!req.body.contains(secret), "minted secret leaked into {}", req.body);
+            assert!(!req.body.contains("wJalrXUtnFEMI"));
+            assert!(!req.headers.iter().any(|(_, v)| v.contains(secret) || v.contains("wJalrXUtnFEMI")));
+        }
+    }
+
+    /// `@` is not an unreserved SigV4 character. An email-style IAM user stays
+    /// one field, encoded once, and the signature is over that encoded body.
+    #[tokio::test]
+    async fn iam_user_at_sign_is_percent_encoded() {
+        use chrono::TimeZone;
+        let mut cred = mgmt();
+        cred.extra.insert("iam_user".into(), "svc@root".into());
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let keys = prov.list_keys(&cred).await.unwrap();
+        assert!(keys.is_empty());
+
+        let req = prov.transport.last();
+        assert_eq!(req.url, IAM_ENDPOINT);
+        assert_eq!(
+            req.body,
+            "Action=ListAccessKeys&UserName=svc%40root&Version=2010-05-08"
+        );
+        assert_eq!(req.body.matches("Action=").count(), 1);
+        assert_eq!(req.body.matches("UserName=").count(), 1);
+        assert!(!req.body.contains("svc@root"));
+        assert!(!req.body.contains("%2540"));
+        let expected = sigv4::sign_query_post(
+            IAM_ENDPOINT,
+            "iam",
+            AWS_REGION,
+            "AKIAEXAMPLEMGMT",
+            "wJalrXUtnFEMI/EXAMPLEKEY",
+            None,
+            &req.body,
+            chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let auth = req.headers.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        let expected_auth = expected.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        assert_eq!(auth, expected_auth);
+        assert!(req.headers.iter().any(|(k, v)| k == "host" && v == "iam.amazonaws.com"));
+        assert!(req.headers.iter().any(|(k, v)| k == "x-amz-date" && v == "20260707T120000Z"));
+        assert!(!req.headers.iter().any(|(_, v)| v.contains("wJalrXUtnFEMI")));
+        assert!(!req.body.contains("wJalrXUtnFEMI"));
+    }
 }
