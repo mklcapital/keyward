@@ -34,3 +34,20 @@ pub fn get(name: &str) -> Result<Box<dyn Provider>> {
         other => anyhow::bail!("unknown provider: {other}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padded_provider_names_are_unknown() {
+        for name in ["aws ", " b2", "r2\n", "aws\t"] {
+            let msg = match get(name) {
+                Ok(_) => panic!("padded provider {name:?} was accepted"),
+                Err(err) => err.to_string(),
+            };
+            assert!(msg.contains("unknown provider"), "{name:?} got: {msg}");
+            assert!(msg.contains(name), "{name:?} got: {msg}");
+        }
+    }
+}

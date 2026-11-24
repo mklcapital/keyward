@@ -577,4 +577,41 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    /// `success: false` with an empty `errors` array still fails closed. The
+    /// token in `result.value` is not minted and is not copied into the error.
+    #[tokio::test]
+    async fn empty_error_list_does_not_mint_or_echo_the_token() {
+        let raw = "RAW-EMPTY-ERRORS-TOKEN";
+        let digest = "bcec204da01b65d52a523db60510ff2d6d2ba5b1fa037438ee7228e0ad24994a";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({
+                "success": false,
+                "errors": [],
+                "result": { "id": "tok-new", "value": raw, "name": "FROM-RESPONSE" }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let err = prov.create_key(&mgmt(), "kw-empty-errors", None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no error detail from Cloudflare"), "got: {msg}");
+        assert!(!msg.contains(raw), "token echoed in error: {msg}");
+        assert!(!msg.contains(digest), "token digest echoed in error: {msg}");
+        assert!(!msg.contains("mgmt-token-value"), "management token echoed: {msg}");
+        assert!(!msg.contains("tok-new"), "got: {msg}");
+
+        let seen = prov.transport.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "create must not be retried after a logical failure");
+        let req = &seen[0];
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        assert!(req.url.ends_with("/accounts/acct-123/tokens"));
+        assert!(!req.url.contains(raw));
+        let body = req.body.as_ref().unwrap().to_string();
+        assert!(!body.contains(raw));
+        assert!(!body.contains(digest));
+        assert!(!body.contains("FROM-RESPONSE"));
+        assert!(!body.contains("mgmt-token-value"));
+    }
 }

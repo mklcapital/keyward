@@ -428,4 +428,21 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    /// The parent of the state file must already be a directory. If that path is
+    /// a file, save fails and leaves the file byte-for-byte.
+    #[test]
+    fn save_does_not_replace_a_file_used_as_the_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("not-a-directory");
+        std::fs::write(&parent, b"KEEP-NOT-A-DIRECTORY").unwrap();
+        let path = parent.join("schedule.json");
+        let mut state = State::default();
+        state.next_run.insert("alpha".into(), Utc::now());
+        let err = state.save(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("creating state dir"), "got: {msg}");
+        assert_eq!(std::fs::read(&parent).unwrap(), b"KEEP-NOT-A-DIRECTORY");
+        assert!(!path.exists());
+    }
 }
