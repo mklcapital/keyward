@@ -428,4 +428,34 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn fresh_targets_draw_jitter_in_config_order_skipping_unscheduled() {
+        use chrono::TimeZone;
+        let base = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let cfg = cfg_with(vec![
+            ("alpha", Some(sched("1h", "1h"))),
+            ("on-demand", None),
+            ("zeta", Some(sched("1h", "1h"))),
+        ]);
+        let mut state = State::default();
+        // One u64 per draw: 0 is the low end of the jitter range, u64::MAX the high end.
+        let mut rng = rand::rngs::mock::StepRng::new(0, u64::MAX);
+        let plan = plan(&cfg, &mut state, base, &mut rng);
+
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].target, "alpha");
+        assert!(plan[0].freshly_scheduled);
+        assert_eq!(plan[0].next_run, base, "full negative jitter clamps to the base instant");
+        assert_eq!(plan[1].target, "zeta");
+        assert!(plan[1].freshly_scheduled);
+        assert_eq!(
+            plan[1].next_run,
+            base + chrono::Duration::hours(2),
+            "the second scheduled target must consume the next draw, not alpha's"
+        );
+        assert!(!state.next_run.contains_key("on-demand"));
+        assert_eq!(state.next_run["alpha"], base);
+        assert_eq!(state.next_run["zeta"], base + chrono::Duration::hours(2));
+    }
 }
