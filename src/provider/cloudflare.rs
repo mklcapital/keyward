@@ -577,4 +577,54 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn create_key_ignores_decoy_tokens_outside_result_value() {
+        let raw = "raw-token-secret";
+        let decoys = ["RAW-MESSAGE-TOKEN", "RAW-RESULT-SECRET", "RAW-RESULT-ALT-TOKEN"];
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({
+                "success": true,
+                "errors": [],
+                "messages": [{ "code": 1000, "message": decoys[0] }],
+                "result": {
+                    "id": "tok-new",
+                    "value": raw,
+                    "secret": decoys[1],
+                    "token": decoys[2],
+                    "name": "FROM-RESPONSE"
+                }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-new", None).await.unwrap();
+
+        assert_eq!(cred.key_id, "tok-new");
+        assert_eq!(cred.extra.get("cf_token_value").map(String::as_str), Some(raw));
+        let derived = Cloudflare::<ReqwestTransport>::derive_secret_access_key(raw);
+        assert_eq!(cred.secret, derived);
+        for decoy in decoys {
+            assert_ne!(cred.secret, Cloudflare::<ReqwestTransport>::derive_secret_access_key(decoy));
+            assert_ne!(cred.extra.get("cf_token_value").map(String::as_str), Some(decoy));
+        }
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.url, format!("{API_BASE}/accounts/acct-123/tokens"));
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.unwrap();
+        assert_eq!(body["name"], "kw-new");
+        assert_ne!(body["name"], "FROM-RESPONSE");
+        let blob = format!("{body}");
+        let extras = format!("{:?}", cred.extra);
+        for decoy in decoys {
+            assert!(!blob.contains(decoy), "{decoy} leaked into the request");
+            assert!(!extras.contains(decoy), "{decoy} leaked into extras");
+            assert!(!cred.secret.contains(decoy));
+        }
+        assert!(!blob.contains(raw));
+        assert!(!blob.contains("mgmt-token-value"));
+        assert!(!req.url.contains(raw));
+    }
 }

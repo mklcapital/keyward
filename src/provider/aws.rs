@@ -990,4 +990,76 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn verify_key_rejects_http_300_even_when_body_has_arn() {
+        let secret = "NEW-SECRET-DO-NOT-ECHO";
+        let arn = "arn:aws:iam::123456789012:user/admin";
+        let body = caller_identity_xml(arn);
+
+        let fake = FakeTransport::new(vec![FakeTransport::ok(300, &body)]);
+        let prov = Aws::with_transport(fake);
+        let err = prov
+            .verify_key(&Credential::new("AKIANEW", secret))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("HTTP 300"), "got: {msg}");
+        assert!(msg.contains("GetCallerIdentity"), "got: {msg}");
+        assert!(!msg.contains(secret), "got: {msg}");
+        assert!(!msg.contains(arn), "got: {msg}");
+        assert!(!msg.contains("123456789012"), "got: {msg}");
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(seen[0].url, STS_ENDPOINT);
+        assert!(seen[0].body.contains("Action=GetCallerIdentity"));
+        assert!(seen[0].body.contains("Version=2011-06-15"));
+        assert!(!seen[0].body.contains(secret));
+        assert!(!seen.iter().any(|r| r.headers.iter().any(|(_, v)| v.contains(secret))));
+
+        // The status check is `>= 300`. The same Arn on 299 is a successful verify.
+        let ok = FakeTransport::new(vec![FakeTransport::ok(299, &body)]);
+        let prov = Aws::with_transport(ok);
+        prov.verify_key(&Credential::new("AKIANEW", secret)).await.unwrap();
+        let req = prov.transport.last();
+        assert_eq!(req.url, STS_ENDPOINT);
+        assert!(!req.body.contains(secret));
+        assert!(!req.headers.iter().any(|(_, v)| v.contains(secret)));
+    }
+
+    #[tokio::test]
+    async fn truncated_list_does_not_follow_marker_or_delete_active_key() {
+        let secret = "PAGE-SECRET-ONCE/only==";
+        let mut xml = list_keys_xml(&[
+            ("AKIAACTIVE", "Active", "2026-06-01T00:00:00Z"),
+            ("AKIASTALE", "Inactive", "2026-01-01T00:00:00Z"),
+        ]);
+        xml = xml.replace(
+            "<IsTruncated>false</IsTruncated>",
+            "<IsTruncated>true</IsTruncated><Marker>PAGE2TOKEN</Marker>",
+        );
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &xml),
+            FakeTransport::ok(200, ""),
+            FakeTransport::ok(200, &create_key_xml("AKIANEW", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-page", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIANEW");
+        assert_eq!(cred.secret, secret);
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 3, "list, one delete, create — no second page");
+        assert_eq!(seen.iter().filter(|r| r.body.contains("Action=ListAccessKeys")).count(), 1);
+        assert!(seen[1].body.contains("Action=DeleteAccessKey"));
+        assert!(seen[1].body.contains("AccessKeyId=AKIASTALE"));
+        assert!(!seen[1].body.contains("AKIAACTIVE"));
+        assert!(!seen.iter().any(|r| r.body.contains("PAGE2TOKEN") || r.body.contains("Marker=")));
+        assert!(!seen.iter().any(|r| r.body.contains(secret) || r.headers.iter().any(|(_, v)| v.contains(secret))));
+        assert!(!seen.iter().any(|r| {
+            r.body.contains("wJalrXUtnFEMI/EXAMPLEKEY")
+                || r.headers.iter().any(|(_, v)| v.contains("wJalrXUtnFEMI/EXAMPLEKEY"))
+        }));
+    }
 }
