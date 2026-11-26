@@ -328,4 +328,25 @@ mod tests {
         let back: RecreationRecipe = env.open_json(&kp).unwrap();
         assert_eq!(back, recipe);
     }
+
+    #[test]
+    fn empty_ciphertext_fails_closed_without_echoing_plaintext() {
+        let kp = KeyPair::generate();
+        let marker = "PLAINTEXT-MARKER-empty-ct";
+        let mut env = Envelope::seal("db/meta", &kp, marker.as_bytes()).unwrap();
+        env.ciphertext_b64.clear();
+        let err = env.open(&kp).unwrap_err();
+        let msg = format!("{err:#}");
+        // Empty base64 is valid and decodes to zero bytes. age must reject that
+        // header rather than returning plaintext.
+        assert!(msg.contains("decrypt"), "{msg}");
+        assert!(msg.contains("Incomplete header"), "{msg}");
+        assert!(!msg.contains(marker), "{msg}");
+        assert!(!msg.contains("db/meta"), "{msg}");
+        assert_eq!(env.label, "db/meta");
+        assert_eq!(env.scheme, Scheme::AgeX25519);
+        let parsed = serde_json::from_str::<Envelope>(&serde_json::to_string(&env).unwrap()).unwrap();
+        assert_eq!(parsed.ciphertext_b64, "");
+        assert!(parsed.open(&kp).is_err());
+    }
 }

@@ -990,4 +990,77 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn iam_user_dollar_and_backslash_stay_one_field() {
+        // `$` and `\` are form/shell metacharacters. They must be one percent-encoded
+        // UserName, not a second field and not left raw for a downstream parser.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let mut cred = mgmt();
+        cred.extra.insert("iam_user".into(), "svc$\\root".into());
+        prov.list_keys(&cred).await.unwrap();
+
+        let req = prov.transport.last();
+        assert_eq!(
+            req.body,
+            "Action=ListAccessKeys&UserName=svc%24%5Croot&Version=2010-05-08"
+        );
+        assert_eq!(req.body.matches("Action=").count(), 1, "{}", req.body);
+        assert_eq!(req.body.matches("UserName=").count(), 1, "{}", req.body);
+        assert!(!req.body.contains('$'), "{}", req.body);
+        assert!(!req.body.contains('\\'), "{}", req.body);
+        assert!(!req.body.contains("%2524"), "must not double-encode $: {}", req.body);
+        assert!(!req.body.contains("%255C"), "must not double-encode \\: {}", req.body);
+
+        let expected = sigv4::sign_query_post(
+            IAM_ENDPOINT,
+            "iam",
+            AWS_REGION,
+            "AKIAEXAMPLEMGMT",
+            "wJalrXUtnFEMI/EXAMPLEKEY",
+            None,
+            &req.body,
+            prov.now(),
+        )
+        .unwrap();
+        let auth = req.headers.iter().find(|(k, _)| k == "authorization").unwrap();
+        let expected_auth = expected.iter().find(|(k, _)| k == "authorization").unwrap();
+        assert_eq!(auth, expected_auth);
+        assert!(req.headers.iter().any(|(k, v)| k == "host" && v == "iam.amazonaws.com"));
+        assert!(req.headers.iter().any(|(k, v)| k == "x-amz-date" && v == "20260707T120000Z"));
+        assert!(!req.body.contains("wJalrXUtnFEMI/EXAMPLEKEY"));
+        assert!(!req.headers.iter().any(|(_, v)| v.contains("wJalrXUtnFEMI/EXAMPLEKEY")));
+        assert_eq!(prov.transport.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_attributed_arn_without_echoing_it() {
+        // The scanner matches the literal `<Arn>` tag. An attributed tag is not a
+        // caller identity, even on HTTP 200, and the Arn value must not leak.
+        let arn = "arn:aws:iam::123456789012:user/svc-backups";
+        let body = format!(
+            "<GetCallerIdentityResponse><GetCallerIdentityResult>\
+             <Arn xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">{arn}</Arn>\
+             <Account>123456789012</Account></GetCallerIdentityResult>\
+             </GetCallerIdentityResponse>"
+        );
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &body)]);
+        let prov = Aws::with_transport(fake);
+        let secret = "NEW-SECRET-DO-NOT-ECHO";
+        let err = prov.verify_key(&Credential::new("AKIANEW", secret)).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no caller Arn"), "{msg}");
+        assert!(!msg.contains(arn), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(!msg.contains("123456789012"), "{msg}");
+
+        let req = prov.transport.last();
+        assert_eq!(req.url, STS_ENDPOINT);
+        assert!(req.body.contains("Action=GetCallerIdentity"), "{}", req.body);
+        assert!(req.body.contains("Version=2011-06-15"), "{}", req.body);
+        assert!(!req.body.contains(secret));
+        assert!(!req.headers.iter().any(|(_, v)| v.contains(secret)));
+        assert_eq!(prov.transport.seen().len(), 1);
+    }
 }

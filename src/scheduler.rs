@@ -428,4 +428,47 @@ mod tests {
         let n = run(&cfg, &path, &hook, None).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[test]
+    fn plan_does_not_rewrite_last_run_and_saves_names_in_order() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let cfg = cfg_with(vec![
+            ("zeta", Some(sched("1d", "0s"))),
+            ("alpha", Some(sched("1d", "0s"))),
+        ]);
+        let mut state = State::default();
+        let persisted = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let last = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        // Insert the later name first. Persistence must follow the name, not insertion.
+        state.next_run.insert("zeta".into(), persisted);
+        state.last_run.insert("zeta".into(), last);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let plan = plan(&cfg, &mut state, now, &mut rng);
+
+        assert_eq!(state.last_run.get("zeta"), Some(&last));
+        assert!(!state.last_run.contains_key("alpha"), "planning must not invent a last_run");
+        assert_eq!(state.next_run.get("zeta"), Some(&persisted));
+        let alpha_next = Utc.with_ymd_and_hms(2026, 7, 8, 12, 0, 0).unwrap();
+        assert_eq!(state.next_run.get("alpha"), Some(&alpha_next));
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].target, "alpha");
+        assert!(plan[0].freshly_scheduled);
+        assert_eq!(plan[0].next_run, alpha_next);
+        assert_eq!(plan[1].target, "zeta");
+        assert!(!plan[1].freshly_scheduled);
+        assert_eq!(plan[1].next_run, persisted);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        state.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let alpha_at = text.find("\"alpha\"").expect("alpha key");
+        let zeta_at = text.find("\"zeta\"").expect("zeta key");
+        assert!(alpha_at < zeta_at, "saved names must be ordered, got {text}");
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.last_run.len(), 1);
+    }
 }

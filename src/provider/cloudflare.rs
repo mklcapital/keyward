@@ -577,4 +577,44 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn account_id_trailing_space_is_not_trimmed() {
+        // The account id is a path segment and an endpoint label. Trimming it
+        // would silently retarget the token API and the derived S3 host.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": "raw-token-secret", "name": "FROM-RESPONSE" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = Credential::new("acct-123 ", "mgmt-token-value");
+        let minted = prov.create_key(&cred, "kw-new", None).await.unwrap();
+
+        assert_eq!(minted.extra.get("account_id").map(String::as_str), Some("acct-123 "));
+        assert_eq!(
+            minted.extra.get("s3_endpoint").map(String::as_str),
+            Some("https://acct-123 .r2.cloudflarestorage.com")
+        );
+        assert_ne!(minted.extra.get("account_id").map(String::as_str), Some("acct-123"));
+        let digest = Cloudflare::<ReqwestTransport>::derive_secret_access_key("raw-token-secret");
+        assert_eq!(minted.secret, digest);
+        assert_eq!(minted.extra.get("cf_token_value").map(String::as_str), Some("raw-token-secret"));
+
+        let req = prov.transport.last();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.url, "https://api.cloudflare.com/client/v4/accounts/acct-123 /tokens");
+        assert!(!req.url.contains("/accounts/acct-123/tokens"), "{}", req.url);
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.expect("create body");
+        assert_eq!(body["name"], "kw-new");
+        assert_ne!(body["name"], "FROM-RESPONSE");
+        let rendered = body.to_string();
+        assert!(!rendered.contains("raw-token-secret"), "{rendered}");
+        assert!(!rendered.contains("mgmt-token-value"), "{rendered}");
+        assert!(!rendered.contains(&digest), "{rendered}");
+        assert!(!req.url.contains("raw-token-secret"));
+        assert!(!req.url.contains("mgmt-token-value"));
+        assert!(!req.url.contains(&digest));
+        assert_eq!(prov.transport.seen.lock().unwrap().len(), 1);
+    }
 }
