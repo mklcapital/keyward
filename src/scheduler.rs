@@ -366,6 +366,26 @@ mod tests {
     }
 
     #[test]
+    fn plan_keeps_last_run_of_a_removed_target() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let cfg = cfg_with(vec![("alpha", Some(sched("1d", "0s")))]);
+        let mut state = State::default();
+        let gone_last = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        state.last_run.insert("gone".into(), gone_last);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let plan = plan(&cfg, &mut state, now, &mut rng);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].target, "alpha");
+        assert!(plan[0].freshly_scheduled);
+        assert_eq!(plan[0].next_run, now + chrono::Duration::days(1));
+        assert!(!plan.iter().any(|p| p.target == "gone"));
+        assert!(!state.next_run.contains_key("gone"));
+        assert_eq!(state.last_run.get("gone"), Some(&gone_last));
+        assert!(!state.last_run.contains_key("alpha"));
+    }
+
+    #[test]
     fn load_missing_state_is_empty_not_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.json");

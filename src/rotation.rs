@@ -117,3 +117,59 @@ pub async fn rotate(t: &Target, store: &dyn SecretStore, opts: &Options) -> Resu
         sealed_recipe,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::KeyInfo;
+
+    fn target(vault: &str, item: &str) -> Target {
+        Target {
+            name: "b2-service".into(),
+            provider: "b2".into(),
+            vault: vault.into(),
+            item: item.into(),
+            field_key_id: "keyID".into(),
+            field_secret: "applicationKey".into(),
+            management_item: "mgmt-ADMIN-ITEM".into(),
+            mgmt_field_key_id: "keyID".into(),
+            mgmt_field_secret: "applicationKey".into(),
+            key_name_prefix: "keyward".into(),
+            schedule: None,
+            recipe_recipient: Some("age1SECRET-RECIPIENT-DO-NOT-COPY".into()),
+            console_url: None,
+        }
+    }
+
+    #[test]
+    fn recipe_does_not_invent_capabilities_for_an_empty_scope() {
+        // The read-only capability fallback belongs to key minting. A recipe for
+        // a key that had no capabilities must not claim listBuckets/listFiles.
+        let recipe = build_recipe(
+            &target("Team\nVault", "svc/key"),
+            Some(&KeyInfo {
+                key_id: "old-key".into(),
+                name: Some("old".into()),
+                capabilities: vec![],
+                bucket_id: Some("bkt-1".into()),
+            }),
+        );
+        assert!(recipe.capabilities.is_empty());
+        assert_eq!(recipe.resource_restrictions, vec!["bucketId:bkt-1".to_string()]);
+        assert_eq!(recipe.provider, "b2");
+        assert!(recipe.console_url.is_none());
+        assert!(recipe.notes.is_none());
+        assert_eq!(recipe.login_reference.as_deref(), Some("op://Team\nVault/svc/key"));
+        let text = serde_json::to_string(&recipe).unwrap();
+        let obj = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text).unwrap();
+        assert_eq!(obj.len(), 6);
+        assert_eq!(text.matches('{').count(), 1);
+        assert!(!text.contains("listBuckets"));
+        assert!(!text.contains("listFiles"));
+        assert!(!text.contains("readFiles"));
+        assert!(!text.contains("deleteFiles"));
+        assert!(!text.contains("mgmt-ADMIN-ITEM"));
+        assert!(!text.contains("age1SECRET"));
+        assert!(!text.contains("DO-NOT-COPY"));
+    }
+}

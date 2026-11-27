@@ -577,4 +577,33 @@ mod tests {
         let err = prov.revoke_key(&mgmt(), "tok").await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "got: {err}");
     }
+
+    #[tokio::test]
+    async fn revoke_ignores_a_mismatched_result_id() {
+        // A successful delete is `success: true`. The result body is not a
+        // second identifier: a different `id` or a token value must not retarget
+        // the request or fail the revoke after Cloudflare already accepted it.
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            json!({
+                "success": true,
+                "errors": [],
+                "messages": [{ "message": "RAW-REVOKE-MESSAGE-TOKEN" }],
+                "result": { "id": "SOME-OTHER-TOKEN", "value": "RAW-RESULT-VALUE" }
+            }),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        prov.revoke_key(&mgmt(), "tok-old").await.unwrap();
+        let seen = prov.transport.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let req = &seen[0];
+        assert_eq!(req.method, "DELETE");
+        assert_eq!(req.url, "https://api.cloudflare.com/client/v4/accounts/acct-123/tokens/tok-old");
+        assert_eq!(req.url.matches("tok-old").count(), 1);
+        assert!(!req.url.contains("SOME-OTHER-TOKEN"));
+        assert!(!req.url.contains("RAW-RESULT-VALUE"));
+        assert!(!req.url.contains("RAW-REVOKE-MESSAGE-TOKEN"));
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        assert!(req.body.is_none());
+    }
 }

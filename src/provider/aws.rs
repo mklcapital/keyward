@@ -990,4 +990,35 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn create_key_keeps_xml_entities_literal() {
+        // IAM returns the secret as raw tag text. Decoding `&amp;` or stopping at
+        // `<` would store a different credential than the one AWS minted.
+        let secret = "wJalr&amp;<still-secret>/==";
+        let fake = FakeTransport::new(vec![
+            FakeTransport::ok(200, &list_keys_xml(&[])),
+            FakeTransport::ok(200, &create_key_xml("AKIA&amp;ONE", secret)),
+        ]);
+        let prov = Aws::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "ignored-name", None).await.unwrap();
+        assert_eq!(cred.key_id, "AKIA&amp;ONE");
+        assert_ne!(cred.key_id, "AKIA&ONE");
+        assert_eq!(cred.secret, secret);
+        assert_ne!(cred.secret, "wJalr&<still-secret>/==");
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|r| r.body.matches("Action=").count() == 1));
+        assert!(seen[0].body.contains("Action=ListAccessKeys"));
+        assert!(seen[1].body.contains("Action=CreateAccessKey"));
+        assert!(seen.iter().all(|r| !r.body.contains("DeleteAccessKey")));
+        for req in &seen {
+            assert!(!req.body.contains("still-secret"), "secret leaked into body: {}", req.body);
+            assert!(!req.body.contains("&amp;"), "entity leaked into body: {}", req.body);
+            assert!(!req.body.contains("wJalr"), "signing secret leaked into body: {}", req.body);
+            assert!(req.headers.iter().all(|(_, v)| {
+                !v.contains("still-secret") && !v.contains("&amp;") && !v.contains("wJalr")
+            }));
+        }
+    }
 }
