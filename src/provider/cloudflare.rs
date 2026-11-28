@@ -460,6 +460,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn double_encoded_policy_does_not_unwrap_into_admin() {
+        // One JSON parse must not turn a quoted policy string into a live
+        // policy. A second decode would copy an admin group the old token
+        // never had as an array.
+        let admin = r#"[{"effect":"allow","permission_groups":[{"id":"ADMIN-DO-NOT-APPLY"}]}]"#;
+        let quoted = serde_json::to_string(admin).unwrap();
+        assert!(quoted.starts_with('"'), "fixture must be a JSON string, not an array");
+        let like = KeyInfo {
+            key_id: "tok-old".into(),
+            name: Some("OLD-ADMIN-TOKEN".into()),
+            capabilities: vec![quoted],
+            bucket_id: None,
+        };
+        let raw = "raw-quoted-token";
+        let fake = FakeTransport::new(vec![FakeTransport::ok(
+            200,
+            envelope(json!({ "id": "tok-new", "value": raw, "name": "FROM-RESPONSE" })),
+        )]);
+        let prov = Cloudflare::with_transport(fake);
+        let cred = prov.create_key(&mgmt(), "kw-quoted", Some(&like)).await.unwrap();
+
+        let fallback = Cloudflare::<ReqwestTransport>::fallback_read_policy("acct-123");
+        assert_eq!(cred.extra.get("policies").map(String::as_str), Some(fallback.to_string().as_str()));
+        assert_eq!(cred.extra.get("cf_token_value").map(String::as_str), Some(raw));
+        assert_eq!(
+            cred.secret,
+            Cloudflare::<ReqwestTransport>::derive_secret_access_key(raw)
+        );
+        assert_ne!(cred.secret, raw);
+
+        let seen = prov.transport.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let req = &seen[0];
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.url, "https://api.cloudflare.com/client/v4/accounts/acct-123/tokens");
+        assert_eq!(req.bearer.as_deref(), Some("mgmt-token-value"));
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["name"], "kw-quoted");
+        assert_eq!(body["policies"], fallback);
+        assert_eq!(body["policies"][0]["permission_groups"][0]["id"], R2_READ_PERMISSION_GROUP);
+        let text = body.to_string();
+        assert!(!text.contains("ADMIN-DO-NOT-APPLY"));
+        assert!(!text.contains("OLD-ADMIN-TOKEN"));
+        assert!(!text.contains("FROM-RESPONSE"));
+        assert!(!text.contains(raw));
+        assert!(!text.contains(&cred.secret));
+        assert!(!text.contains("mgmt-token-value"));
+        assert!(!req.url.contains(raw));
+        assert!(!req.url.contains("ADMIN-DO-NOT-APPLY"));
+        assert!(!req.url.contains("mgmt-token-value"));
+    }
+
+    #[tokio::test]
     async fn list_keys_parses_tokens_and_policies() {
         let fake = FakeTransport::new(vec![FakeTransport::ok(
             200,
