@@ -990,4 +990,64 @@ mod tests {
         // A user with no keys → empty vec, no panic.
         assert!(xml::parse_access_key_metadata(&list_keys_xml(&[])).is_empty());
     }
+
+    #[tokio::test]
+    async fn iam_user_comma_tab_quote_and_semicolon_stay_one_field() {
+        // A comma, tab, quote, or semicolon in the IAM user must not open a
+        // second form field or a second header. The signature is over the
+        // encoded body, not a decoded or split one.
+        let user = "svc,\t\";root";
+        let mut cred = mgmt();
+        cred.extra.insert("iam_user".into(), user.into());
+        let fake = FakeTransport::new(vec![FakeTransport::ok(200, &list_keys_xml(&[]))]);
+        let prov = Aws::with_transport(fake);
+        let keys = prov.list_keys(&cred).await.unwrap();
+        assert!(keys.is_empty());
+
+        let seen = prov.transport.seen();
+        assert_eq!(seen.len(), 1);
+        let req = &seen[0];
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.url, IAM_ENDPOINT);
+        let body = "Action=ListAccessKeys&UserName=svc%2C%09%22%3Broot&Version=2010-05-08";
+        assert_eq!(req.body, body);
+        assert_eq!(req.body.matches("Action=").count(), 1);
+        assert_eq!(req.body.matches("UserName=").count(), 1);
+        assert!(!req.body.contains("svc,"));
+        assert!(!req.body.contains('\t'));
+        assert!(!req.body.contains('"'));
+        assert!(!req.body.contains(';'));
+        assert!(!req.body.contains(user));
+
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap();
+        let expected = sigv4::sign_query_post(
+            IAM_ENDPOINT,
+            "iam",
+            AWS_REGION,
+            "AKIAEXAMPLEMGMT",
+            "wJalrXUtnFEMI/EXAMPLEKEY",
+            None,
+            body,
+            now,
+        )
+        .unwrap();
+        let auth = req.headers.iter().find(|(k, _)| k == "authorization").unwrap();
+        let expected_auth = expected.iter().find(|(k, _)| k == "authorization").unwrap();
+        assert_eq!(auth.1, expected_auth.1);
+        let host = req.headers.iter().find(|(k, _)| k == "host").unwrap();
+        assert_eq!(host.1, "iam.amazonaws.com");
+        let date = req.headers.iter().find(|(k, _)| k == "x-amz-date").unwrap();
+        assert_eq!(date.1, "20260707T120000Z");
+        let content_type = req.headers.iter().find(|(k, _)| k == "content-type").unwrap();
+        assert!(content_type.1.contains("charset=utf-8"));
+        assert!(!req.body.contains("wJalr"));
+        assert!(!req.body.contains("EXAMPLEKEY"));
+        for (_, value) in &req.headers {
+            assert!(!value.contains("wJalr"), "signing secret leaked into a header: {value}");
+            assert!(!value.contains("EXAMPLEKEY"), "signing secret leaked into a header: {value}");
+            assert!(!value.contains('\t'));
+            assert!(!value.contains('"'));
+        }
+    }
 }
